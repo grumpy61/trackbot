@@ -15,7 +15,7 @@ Based on the structure of picamera2's imx500_object_detection_demo.py
 
 Usage:
     python3 yellow_ball_tracker.py \
-        --model /usr/share/imx500-models/imx500_network_ssd_mobilenetv2_fpnlite_320x320_pp.rpk \
+        --model ssd \
         --class-name "sports ball" \
         --color-check \
         --show-preview
@@ -52,6 +52,11 @@ class Detection:
         self.box = imx500.convert_inference_coords(coords, metadata, picam2)  # (x, y, w, h)
 
 
+def debug_print(msg):
+    if args.debug:
+        print(msg)
+
+
 def parse_detections(metadata: dict):
     """Parse the output tensor into detections, scaled to the ISP output."""
     global last_detections
@@ -78,6 +83,12 @@ def parse_detections(metadata: dict):
             boxes = boxes / input_h
         if bbox_order == "xy":
             boxes = boxes[:, [1, 0, 3, 2]]
+
+    # DEBUG: show the raw (pre-threshold) confidence for the target class every frame,
+    # so we can tell a borderline-confidence miss from a total miss. Remove once done.
+    target_scores = [float(s) for s, c in zip(scores, classes) if int(c) == target_label_idx]
+    best_target_score = max(target_scores, default=0.0)
+    debug_print(f"DEBUG: best '{args.class_name}' score={best_target_score:.3f} (threshold={threshold})")
 
     last_detections = [
         Detection(box, category, score, metadata)
@@ -126,12 +137,18 @@ def is_yellow_cielab(frame_rgb, box):
     # for shading while still rejecting strongly green/red/blue pixels.
     mask = cv2.inRange(lab, (60, 100, 150), (255, 150, 255))
     yellow_fraction = np.count_nonzero(mask) / mask.size
-    return yellow_fraction > args.yellow_fraction
+    if yellow_fraction > args.yellow_fraction:
+        # Looks yellow enough to pass the test
+        return True
+    debug_print(f"DEBUG: Non yellow ball found: {yellow_fraction:.3f} less than threshold {args.yellow_fraction})")
+    return
 
 
 def is_yellow(frame_rgb, box):
     if args.color_space == "lab":
+        #print("Using CIELab color space for yellow check")
         return is_yellow_cielab(frame_rgb, box)
+    #print("Using HSV color space for yellow check")
     return is_yellow_hsv(frame_rgb, box)
 
 
@@ -144,9 +161,12 @@ def pick_best_detection(detections, target_label_idx, frame_rgb=None, color_chec
         candidates = [d for d in candidates if is_yellow(frame_rgb, d.box)]
 
     if not candidates:
+        #print("No candidates found")
         return None
 
     if tracked_center is not None:
+        # Use closest-to-tracked-center as the best candidate,
+        # to avoid jittery switching between multiple balls.
         def dist(d):
             x, y, w, h = d.box
             cx, cy = x + w / 2, y + h / 2
@@ -167,37 +187,60 @@ def draw_overlay(request, stream="main"):
                 cv2.circle(m.array, (int(tracked_center[0]), int(tracked_center[1])), 6, (255, 0, 0, 0), -1)
 
 
+MODEL_CONFIGS = {
+    # Both .rpk files here have on-chip ("_pp" = post-processed) box decoding fused into
+    # the network, so they emit already-decoded [boxes, scores, classes, count] tensors --
+    # neither needs (or works with) the host-side postprocess_nanodet_detection() decode.
+    "nanodet": {
+        "path": "/usr/share/imx500-models/imx500_network_nanodet_plus_416x416_pp.rpk",
+        "postprocess": "",
+    },
+    "ssd": {
+        "path": "/usr/share/imx500-models/imx500_network_ssd_mobilenetv2_fpnlite_320x320_pp.rpk",
+        "postprocess": "",
+    },
+}
+
+
 def get_args():
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--model", type=str,
-        default="/usr/share/imx500-models/imx500_network_ssd_mobilenetv2_fpnlite_320x320_pp.rpk",
-        help="Path to the .rpk model",
+        "--model", choices=sorted(MODEL_CONFIGS), default="ssd",
+        help="Which on-sensor model to use (picks the .rpk path and matching postprocess type)",
     )
     parser.add_argument("--class-name", type=str, default="sports ball",
                          help="COCO label to filter detections to")
-    parser.add_argument("--threshold", type=float, default=0.5, help="Detection confidence threshold")
+    parser.add_argument("--threshold", type=float, default=0.12, help="Detection confidence threshold")
     parser.add_argument("--iou", type=float, default=0.65, help="IoU threshold for NMS")
     parser.add_argument("--max-detections", type=int, default=10, help="Max detections per frame")
     parser.add_argument("--bbox-normalization", action=argparse.BooleanOptionalAction, help="Normalize bbox")
     parser.add_argument("--bbox-order", choices=["yx", "xy"], default="yx",
                          help="bbox coord order: yx -> (y0,x0,y1,x1), xy -> (x0,y0,x1,y1)")
-    parser.add_argument("--postprocess", choices=["", "nanodet"], default=None, help="Postprocess type")
     parser.add_argument("--labels", type=str, help="Path to labels file (defaults to model's own labels)")
     parser.add_argument("--color-check", action="store_true",
                          help="Require an HSV yellow check on top of the class filter")
-    parser.add_argument("--yellow-fraction", type=float, default=0.1,
+    parser.add_argument("--yellow-fraction", type=float, default=0.08,
                          help="Minimum fraction of box pixels that must be yellow to accept (with --color-check)")
     parser.add_argument("--color-space", choices=["hsv", "lab"], default="hsv",
                          help="Color space used for the --color-check yellow test")
     parser.add_argument("--show-preview", action="store_true", help="Show a live preview window")
+    parser.add_argument("--debug", action="store_true", help="Print verbose per-frame debug info")
     return parser.parse_args()
 
+"""" example commands:
+./track_yellow_ball.py --color-check --color-space lab --show-preview
+
+./track_yellow_ball.py --color-check --color-space lab --model nanodet --show-preview
+
+Default uses ssd, same as above:
+./track_yellow_ball.py --color-check --color-space lab --model ssd --show-preview
+"""
 
 if __name__ == "__main__":
     args = get_args()
+    model_config = MODEL_CONFIGS[args.model]
 
-    imx500 = IMX500(args.model)
+    imx500 = IMX500(model_config["path"])
     intrinsics = imx500.network_intrinsics
     if not intrinsics:
         intrinsics = NetworkIntrinsics()
@@ -207,11 +250,15 @@ if __name__ == "__main__":
         sys.exit(1)
 
     for key, value in vars(args).items():
+        if key == "model":
+            continue
         if key == "labels" and value is not None:
             with open(value, "r") as f:
                 intrinsics.labels = f.read().splitlines()
         elif hasattr(intrinsics, key) and value is not None:
             setattr(intrinsics, key, value)
+
+    intrinsics.postprocess = model_config["postprocess"]
 
     if intrinsics.labels is None:
         with open("assets/coco_labels.txt", "r") as f:
@@ -277,4 +324,3 @@ if __name__ == "__main__":
 
     except KeyboardInterrupt:
         pass
-    
