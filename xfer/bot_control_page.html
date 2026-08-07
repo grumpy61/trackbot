@@ -1,0 +1,323 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>Robot Control</title>
+<style>
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; user-select: none; }
+  html, body {
+    margin: 0; padding: 0;
+    height: 100%;
+    background: #111318; color: #eee;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    overscroll-behavior: none;
+    touch-action: none;
+  }
+  body {
+    min-height: 100dvh;
+    display: flex;
+    flex-direction: column;
+  }
+  #main {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 24px 16px calc(16px + env(safe-area-inset-bottom));
+    padding-top: max(24px, env(safe-area-inset-top));
+    padding-left: max(16px, env(safe-area-inset-left));
+    padding-right: max(16px, env(safe-area-inset-right));
+  }
+
+  #top-controls {
+    flex-shrink: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    width: 100%;
+  }
+
+  #joystick-wrap { margin-top: 10px; }
+  #joystick-base {
+    position: relative;
+    width: min(260px, 62vmin); height: min(260px, 62vmin);
+    border-radius: 50%;
+    background: radial-gradient(circle at 50% 45%, #23262f, #1a1c23 70%);
+    border: 2px solid #33384a;
+    box-shadow: inset 0 0 30px rgba(0,0,0,0.5);
+    touch-action: none;
+  }
+  #joystick-stick {
+    position: absolute;
+    width: 36%; height: 36%;
+    left: 50%; top: 50%;
+    margin-left: -18%; margin-top: -18%;
+    border-radius: 50%;
+    background: radial-gradient(circle at 35% 30%, #5eb0ff, #2a72c9 75%);
+    box-shadow: 0 4px 14px rgba(0,0,0,0.5);
+    transition: transform 0.08s linear;
+  }
+  #joystick-readout {
+    text-align: center;
+    margin-top: 12px;
+    font-size: 13px;
+    color: #8a8f9c;
+    font-variant-numeric: tabular-nums;
+  }
+
+  #buttons {
+    display: flex;
+    gap: 14px;
+    margin-top: 14px;
+    width: 100%;
+    max-width: 420px;
+    justify-content: center;
+  }
+  .btn {
+    flex: 1;
+    padding: 20px 0;
+    text-align: center;
+    border-radius: 14px;
+    background: #1e222b;
+    border: 2px solid #33384a;
+    color: #cfd3dc;
+    font-size: 14px;
+    font-weight: 700;
+    letter-spacing: 0.5px;
+  }
+  .btn.on {
+    background: #1f6b3a;
+    border-color: #3ddc84;
+    color: #d8ffe9;
+  }
+
+  /* Open area reserved for future data/controls; status text sits at its bottom. */
+  #status-area {
+    flex: 1;
+    min-height: 24px;
+    width: 100%;
+    max-width: 420px;
+    display: flex;
+    flex-direction: column;
+    justify-content: flex-end;
+  }
+  #status-line {
+    display: flex;
+    align-items: flex-end;
+    gap: 10px;
+    padding-top: 12px;
+    border-top: 1px solid #2a2e38;
+  }
+  #status-text {
+    flex: 1;
+    color: #7fd4ff;
+    font-weight: 600;
+    font-size: 14px;
+    line-height: 1.4;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  #conn-dot {
+    width: 10px; height: 10px; border-radius: 50%;
+    background: #444; flex-shrink: 0; margin-bottom: 4px;
+    transition: background 0.2s;
+  }
+  #conn-dot.ok { background: #3ddc84; }
+  #conn-dot.bad { background: #ff4d4d; }
+
+  @media (orientation: landscape) {
+    #main {
+      flex-direction: row;
+      align-items: stretch;
+      gap: 32px;
+      padding-top: max(12px, env(safe-area-inset-top));
+      padding-bottom: max(12px, env(safe-area-inset-bottom));
+    }
+    #top-controls { flex-shrink: 0; width: auto; }
+    #joystick-wrap { margin-top: 0; }
+    #buttons { margin-top: 12px; max-width: 220px; }
+    #status-area { max-width: none; }
+  }
+</style>
+</head>
+<body>
+
+<div id="main">
+  <div id="top-controls">
+    <div id="joystick-wrap">
+      <div id="joystick-base">
+        <div id="joystick-stick"></div>
+      </div>
+      <div id="joystick-readout">x: 0.00&nbsp;&nbsp;y: 0.00</div>
+    </div>
+
+    <div id="buttons">
+      <div class="btn" data-btn="button1">BUTTON 1</div>
+      <div class="btn" data-btn="button2">BUTTON 2</div>
+      <div class="btn" data-btn="button3">BUTTON 3</div>
+    </div>
+  </div>
+
+  <div id="status-area">
+    <div id="status-line">
+      <div id="status-text">Ready</div>
+      <div id="conn-dot"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+(function () {
+  "use strict";
+
+  // ---------- Joystick ----------
+  var base = document.getElementById("joystick-base");
+  var stick = document.getElementById("joystick-stick");
+  var readout = document.getElementById("joystick-readout");
+
+  var dragging = false;
+  var curX = 0, curY = 0;       // normalized -1..1, y positive = up
+  var pendingX = 0, pendingY = 0;
+  var dirty = false;
+
+  function baseGeometry() {
+    var r = base.getBoundingClientRect();
+    return { cx: r.left + r.width / 2, cy: r.top + r.height / 2, radius: r.width / 2 };
+  }
+
+  function updateStick(nx, ny) {
+    var geo = baseGeometry();
+    var maxOffset = geo.radius - stick.offsetWidth / 2; // keep stick inside base
+    stick.style.transform = "translate(" + (nx * maxOffset) + "px," + (-ny * maxOffset) + "px)";
+    readout.textContent = "x: " + nx.toFixed(2) + "   y: " + ny.toFixed(2);
+  }
+
+  function setVector(clientX, clientY) {
+    var geo = baseGeometry();
+    var dx = clientX - geo.cx;
+    var dy = clientY - geo.cy;
+    var dist = Math.sqrt(dx * dx + dy * dy);
+    if (dist > geo.radius) {
+      dx = (dx / dist) * geo.radius;
+      dy = (dy / dist) * geo.radius;
+    }
+    var nx = dx / geo.radius;
+    var ny = -dy / geo.radius; // invert so up = positive
+    curX = nx; curY = ny;
+    pendingX = nx; pendingY = ny;
+    dirty = true;
+    updateStick(nx, ny);
+  }
+
+  function resetVector() {
+    curX = 0; curY = 0;
+    pendingX = 0; pendingY = 0;
+    dirty = true;
+    updateStick(0, 0);
+  }
+
+  function onDown(e) {
+    dragging = true;
+    var p = eventPoint(e);
+    setVector(p.x, p.y);
+    e.preventDefault();
+  }
+  function onMove(e) {
+    if (!dragging) return;
+    var p = eventPoint(e);
+    setVector(p.x, p.y);
+    e.preventDefault();
+  }
+  function onUp(e) {
+    if (!dragging) return;
+    dragging = false;
+    resetVector();
+    sendJoystick(); // send zero immediately for safety
+    e.preventDefault();
+  }
+  function eventPoint(e) {
+    if (e.touches && e.touches.length) {
+      return { x: e.touches[0].clientX, y: e.touches[0].clientY };
+    }
+    if (e.changedTouches && e.changedTouches.length) {
+      return { x: e.changedTouches[0].clientX, y: e.changedTouches[0].clientY };
+    }
+    return { x: e.clientX, y: e.clientY };
+  }
+
+  base.addEventListener("mousedown", onDown);
+  window.addEventListener("mousemove", onMove);
+  window.addEventListener("mouseup", onUp);
+  base.addEventListener("touchstart", onDown, { passive: false });
+  window.addEventListener("touchmove", onMove, { passive: false });
+  window.addEventListener("touchend", onUp, { passive: false });
+  window.addEventListener("touchcancel", onUp, { passive: false });
+
+  function setConn(ok) {
+    var dot = document.getElementById("conn-dot");
+    dot.className = ok ? "ok" : "bad";
+  }
+
+  function sendJoystick() {
+    var x = pendingX, y = pendingY;
+    dirty = false;
+    fetch("/control", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ x: x, y: y })
+    }).then(function (r) { setConn(r.ok); }).catch(function () { setConn(false); });
+  }
+
+  // Throttled sender: ~10 updates/sec while dragging, plus final zero on release.
+  setInterval(function () {
+    if (dirty) sendJoystick();
+  }, 100);
+
+  // ---------- Buttons ----------
+  var buttonStates = { button1: false, button2: false, button3: false };
+  var btnEls = {};
+
+  document.querySelectorAll(".btn").forEach(function (el) {
+    btnEls[el.getAttribute("data-btn")] = el;
+  });
+
+  function applyButtonStates(buttons) {
+    Object.keys(buttons).forEach(function (name) {
+      buttonStates[name] = !!buttons[name];
+      if (btnEls[name]) btnEls[name].classList.toggle("on", buttonStates[name]);
+    });
+  }
+
+  document.querySelectorAll(".btn").forEach(function (el) {
+    el.addEventListener("click", function () {
+      var name = el.getAttribute("data-btn");
+      var newVal = !buttonStates[name];
+      buttonStates[name] = newVal;
+      el.classList.toggle("on", newVal);
+      fetch("/button/" + name, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ value: newVal })
+      }).then(function (r) { setConn(r.ok); }).catch(function () { setConn(false); });
+    });
+  });
+
+  // ---------- Status polling ----------
+  function pollStatus() {
+    fetch("/status").then(function (r) {
+      setConn(r.ok);
+      return r.json();
+    }).then(function (data) {
+      document.getElementById("status-text").textContent = data.status;
+      if (data.buttons) applyButtonStates(data.buttons);
+    }).catch(function () { setConn(false); });
+  }
+  setInterval(pollStatus, 1000);
+  pollStatus();
+
+})();
+</script>
+</body>
+</html>
