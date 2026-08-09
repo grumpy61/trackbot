@@ -6,7 +6,7 @@ High-level main loop for trackbot. Owns the operating mode and ticks the
 active behavior each cycle -- currently ball-following via YellowBallTracker.
 
 Extension points for future work:
-    Controller  -- bluetooth controller input (poll() is a stub for now)
+    BTGamepadController  -- bluetooth gamepad input, see bot_gamepad.py
     SensorHub   -- onboard sensor processing (read() is a stub for now)
     Mode.MANUAL -- direct drive from controller commands, once wired up
 
@@ -19,6 +19,7 @@ import sys
 import time
 from enum import Enum, auto
 
+from bot_gamepad import BTGamepadController
 from track_yellow_ball import YellowBallTracker
 
 
@@ -26,15 +27,6 @@ class Mode(Enum):
     IDLE = auto()
     FOLLOW_BALL = auto()
     MANUAL = auto()
-
-
-class Controller:
-    """Placeholder for the bluetooth controller. poll() always reports no
-    input until this is wired up, so mode switches and manual drive commands
-    are inert for now."""
-
-    def poll(self):
-        return None  # TODO: read bluetooth controller input, return a command
 
 
 class SensorHub:
@@ -66,7 +58,7 @@ def get_args():
 
 
 def mainloop(tracker, start_mode="follow_ball"):
-    controller = Controller()
+    controller = BTGamepadController()
     sensors = SensorHub()
     mode = Mode[start_mode.upper()]
 
