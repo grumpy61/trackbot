@@ -37,6 +37,7 @@ from dataclasses import dataclass
 
 import cv2
 import numpy as np
+from libcamera import Transform
 
 from picamera2 import MappedArray, Picamera2
 from picamera2.devices import IMX500
@@ -68,10 +69,17 @@ class TrackResult:
 
 
 class Detection:
-    def __init__(self, coords, category, conf, metadata, imx500, picam2):
+    def __init__(self, coords, category, conf, metadata, imx500, picam2, frame_size):
         self.category = category
         self.conf = conf
-        self.box = imx500.convert_inference_coords(coords, metadata, picam2)  # (x, y, w, h)
+        x, y, w, h = imx500.convert_inference_coords(coords, metadata, picam2)
+        # The camera is mounted upside down, so YellowBallTracker.start() applies a
+        # 180deg Transform to the ISP output (preview/color-check/overlay all see a
+        # right-side-up image). But the on-sensor NN computes boxes on the raw,
+        # pre-transform sensor frame, and convert_inference_coords doesn't know about
+        # the transform -- so flip the box here to match the corrected image.
+        frame_w, frame_h = frame_size
+        self.box = (frame_w - x - w, frame_h - y - h, w, h)
 
 
 class YellowBallTracker:
@@ -148,7 +156,8 @@ class YellowBallTracker:
     def start(self):
         self.picam2 = Picamera2(self.imx500.camera_num)
         config = self.picam2.create_preview_configuration(
-            controls={"FrameRate": self.intrinsics.inference_rate}, buffer_count=12
+            controls={"FrameRate": self.intrinsics.inference_rate}, buffer_count=12,
+            transform=Transform(hflip=True, vflip=True),  # camera is mounted upside down
         )
         self.imx500.show_network_fw_progress_bar()
         self.picam2.start(config, show_preview=self.show_preview)
@@ -223,8 +232,9 @@ class YellowBallTracker:
             f"DEBUG: best '{self.class_name}' score={best_target_score:.3f} (threshold={self.threshold})"
         )
 
+        frame_size = (self.frame_w, self.frame_h)
         self.last_detections = [
-            Detection(box, category, score, metadata, self.imx500, self.picam2)
+            Detection(box, category, score, metadata, self.imx500, self.picam2, frame_size)
             for box, score, category in zip(boxes, scores, classes)
             if score > self.threshold
         ]
@@ -360,8 +370,9 @@ if __name__ == "__main__":
             debug=args.debug,
             show_preview=args.show_preview,
         )
-    except ValueError as e:
-        print(e, file=sys.stderr)
+    except (ValueError, RuntimeError) as e:
+        print("Error initializing YellowBallTracker:", file=sys.stderr)
+        print(f"  {e}", file=sys.stderr)
         sys.exit(1)
 
     tracker.start()
