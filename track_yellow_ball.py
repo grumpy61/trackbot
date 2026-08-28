@@ -43,6 +43,8 @@ from picamera2 import MappedArray, Picamera2
 from picamera2.devices import IMX500
 from picamera2.devices.imx500 import NetworkIntrinsics, postprocess_nanodet_detection
 
+from video_recorder import VideoRecorder
+
 SMOOTHING = 0.5  # 0 = no smoothing, closer to 1 = heavier smoothing
 
 MODEL_CONFIGS = {
@@ -100,6 +102,7 @@ class YellowBallTracker:
         color_space="hsv",
         debug=False,
         show_preview=False,
+        record_preview=False,
     ):
         self.class_name = class_name
         self.threshold = threshold
@@ -110,6 +113,7 @@ class YellowBallTracker:
         self.color_space = color_space
         self.debug = debug
         self.show_preview = show_preview
+        self.video_recorder = VideoRecorder(enabled=record_preview)
 
         model_config = MODEL_CONFIGS[model]
         self.imx500 = IMX500(model_config["path"])
@@ -169,13 +173,16 @@ class YellowBallTracker:
             self.picam2.pre_callback = self.draw_overlay
 
         self.frame_w, self.frame_h = self.picam2.stream_configuration("main")["size"]
+        self.video_recorder.start(self.picam2)
 
     def stop(self):
         if self.picam2 is not None:
+            self.video_recorder.stop()
             self.picam2.stop()
 
     def tick(self):
         """Capture and process one frame. Returns a TrackResult, or None if the ball wasn't found."""
+        self.video_recorder.tick()
         metadata = self.picam2.capture_metadata()
         detections = self._parse_detections(metadata)
 
@@ -339,6 +346,8 @@ def get_args():
                          help="Color space used for the --color-check yellow test")
     parser.add_argument("--show-preview", action="store_true", help="Show a live preview window")
     parser.add_argument("--debug", action="store_true", help="Print verbose per-frame debug info")
+    parser.add_argument("--record-preview", action=argparse.BooleanOptionalAction, default=False,
+                         help="Record camera video to ~/Videos/Trackbot (default: off)")
     return parser.parse_args()
 
 
@@ -369,6 +378,7 @@ if __name__ == "__main__":
             color_space=args.color_space,
             debug=args.debug,
             show_preview=args.show_preview,
+            record_preview=args.record_preview,
         )
     except (ValueError, RuntimeError) as e:
         print("Error initializing YellowBallTracker:", file=sys.stderr)

@@ -11,17 +11,20 @@ from evdev import ecodes
 
 # This gamepad's D-pad shows up as plain keyboard keycodes rather than BTN_DPAD_*/
 # ABS_HAT0X,Y -- confirmed by testing: UP sends 'c', DOWN sends 'd', LEFT sends 'e',
-# RIGHT sends 'f'.
+# RIGHT sends 'f', and the "stop" button sends 'g'.
 KEY_UP = ecodes.KEY_C
 KEY_DOWN = ecodes.KEY_D
 KEY_LEFT = ecodes.KEY_E
 KEY_RIGHT = ecodes.KEY_F
+KEY_STOP = ecodes.KEY_G
 
 # Step size range for easing throttle/steering toward the D-pad's target each time
-# process_command() runs: small steps near zero (gentle start/fine control), larger
-# steps further out (faster ramp once already moving). First pass, tune on hardware.
-MIN_STEP = 0.02
-MAX_STEP = 0.10
+# process_command() runs: near zero (gentle start/fine control), larger steps
+# further out (faster ramp once already moving). MIN_STEP needs to clear the
+# motor's deadband in one press -- at 0.02 it took 5+ presses from a stop before
+# the motor actually moved.
+MIN_STEP = 0.15
+MAX_STEP = 0.35
 
 
 def _step_toward(current, target):
@@ -54,6 +57,13 @@ class BotCommandHandler:
     def process_command(self, command):
         """command is a bot_gamepad.GamepadState (buttons + axes dicts)."""
         buttons = command.buttons
+
+        if buttons.get(KEY_STOP, False):
+            # Immediate stop/zero, bypassing the eased ramp entirely.
+            self.throttle = 0.0
+            self.steering = 0.0
+            return
+
         up = buttons.get(KEY_UP, False)
         down = buttons.get(KEY_DOWN, False)
         left = buttons.get(KEY_LEFT, False)

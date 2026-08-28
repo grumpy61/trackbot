@@ -23,6 +23,7 @@ from enum import Enum, auto
 from bot_commands import BotCommandHandler
 from bot_gamepad import BTGamepadController
 from bot_motor import BotMotor
+from plain_camera import PlainCameraViewer
 from track_yellow_ball import YellowBallTracker
 
 
@@ -66,14 +67,31 @@ def get_args():
     parser.add_argument("--debug", action="store_true", help="Print verbose per-frame debug info")
     parser.add_argument("--start-mode", choices=[m.name.lower() for m in Mode], default="follow_ball",
                          help="Operating mode to start in")
+    parser.add_argument("--record-preview", action=argparse.BooleanOptionalAction, default=False,
+                         help="Record camera video to ~/Videos/Trackbot (default: off)")
     return parser.parse_args()
 
 
-def mainloop(tracker, motor, start_mode="follow_ball"):
-    controller = BTGamepadController()
+def mainloop(tracker, motor, start_mode="follow_ball", debug=False):
+    controller = BTGamepadController(verbose=debug)
     command_handler = BotCommandHandler()
     sensors = SensorHub()
     mode = Mode[start_mode.upper()]
+    last_debug_msg = None
+
+    def debug_print(msg):
+        nonlocal last_debug_msg
+        if debug and msg != last_debug_msg:
+            print(msg)
+        last_debug_msg = msg
+
+    if isinstance(tracker, PlainCameraViewer) and mode is Mode.FOLLOW_BALL:
+        # PlainCameraViewer.tick() never finds anything -- no AI camera is attached,
+        # so FOLLOW_BALL can't do anything but spam "ball not found". MANUAL still
+        # works without AI detection, so start there instead.
+        print("[mainloop] No AI camera available (plain camera fallback in use) -- "
+              "starting in MANUAL instead of FOLLOW_BALL.")
+        mode = Mode.MANUAL
 
     try:
         while True:
@@ -87,13 +105,20 @@ def mainloop(tracker, motor, start_mode="follow_ball"):
                 result = tracker.tick()
                 if result is not None:
                     throttle, steering = _follow_ball_throttle_steering(result)
+                    debug_print(f"[mainloop] FOLLOW_BALL: motor.drive(throttle={throttle:.3f}, steering={steering:.3f})")
                     motor.drive(throttle=throttle, steering=steering)
                 else:
+                    debug_print("[mainloop] FOLLOW_BALL: ball not found -> motor.stop()")
                     motor.stop()
             elif mode is Mode.MANUAL:
+                debug_print(
+                    f"[mainloop] MANUAL: motor.drive(throttle={command_handler.throttle:.3f}, "
+                    f"steering={command_handler.steering:.3f})"
+                )
                 motor.drive(throttle=command_handler.throttle, steering=command_handler.steering)
                 time.sleep(0.05)
             else:  # Mode.IDLE
+                debug_print("[mainloop] IDLE: motor.stop()")
                 motor.stop()
                 time.sleep(0.05)
     except KeyboardInterrupt:
@@ -104,21 +129,52 @@ def mainloop(tracker, motor, start_mode="follow_ball"):
         tracker.stop()
 
 
-def main():
-    args = get_args()
+# Raised by IMX500(...) when no AI camera is attached. Checked explicitly below so an
+# unrelated RuntimeError from YellowBallTracker/IMX500 setup doesn't get misread as
+# "no IMX500 camera" and silently swallowed into a fallback.
+IMX500_NOT_FOUND_ERROR = "IMX500: Requested camera dev-node not found"
 
-    tracker = YellowBallTracker(
-        model=args.model,
-        color_check=args.color_check,
-        color_space=args.color_space,
-        debug=args.debug,
-        show_preview=args.show_preview,
-    )
-    tracker.start()
+
+def init(args):
+    """Start the camera (IMX500 AI camera preferred, plain camera fallback) and the
+    motor controller. Returns (tracker, motor); tracker is either a YellowBallTracker
+    or, if no IMX500 is attached, a PlainCameraViewer (no detection, view-only)."""
+    need_fallback = False
+    try:
+        tracker = YellowBallTracker(
+            model=args.model,
+            color_check=args.color_check,
+            color_space=args.color_space,
+            debug=args.debug,
+            show_preview=args.show_preview,
+            record_preview=args.record_preview,
+        )
+        tracker.start()
+    except RuntimeError as e:
+        if str(e) != IMX500_NOT_FOUND_ERROR:
+            raise
+        print(f"[init] IMX500 camera unavailable ({e}); falling back to plain camera preview.")
+        need_fallback = True
+
+    if need_fallback:
+        try:
+            # No ball detection on a plain camera, but still worth a look, so force
+            # the preview on regardless of --show-preview; without it this path
+            # shows nothing at all.
+            tracker = PlainCameraViewer(show_preview=True, record_preview=args.record_preview)
+            tracker.start()
+        except Exception as e:
+            print(f"[init] Plain camera fallback also failed: {e}", file=sys.stderr)
+            raise
 
     motor = BotMotor()
+    return tracker, motor
 
-    mainloop(tracker, motor, start_mode=args.start_mode)
+
+def main():
+    args = get_args()
+    tracker, motor = init(args)
+    mainloop(tracker, motor, start_mode=args.start_mode, debug=args.debug)
 
 
 if __name__ == "__main__":
