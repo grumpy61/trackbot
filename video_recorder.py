@@ -26,24 +26,44 @@ MIN_FREE_BYTES = 50 * 1024 ** 3  # don't record if less than this much free spac
 
 
 class VideoRecorder:
-    """enabled=False makes start()/stop()/tick() no-ops, so callers don't need to branch."""
+    """enabled controls only whether recording auto-starts in start(); the camera
+    reference is kept either way, so resume()/pause() can toggle recording on or
+    off at runtime (e.g. from a manual key-press command) regardless of how it
+    started."""
 
     def __init__(self, enabled=True):
         self.enabled = enabled
         self._picam2 = None
-        self._recording = False
+        self._want_recording = False  # caller's desired on/off state, via resume()/pause()
+        self._recording = False  # whether a segment is actually being encoded right now
         self._segment_start = None
 
+    @property
+    def recording(self):
+        return self._recording
+
     def start(self, picam2):
-        if not self.enabled:
-            return
         self._picam2 = picam2
+        if self.enabled:
+            self.resume()
+
+    def resume(self):
+        """Start (or restart) recording. No-op if already recording or start() hasn't run."""
+        self._want_recording = True
+        if self._picam2 is None or self._recording:
+            return
         self._start_segment()
+
+    def pause(self):
+        """Stop recording without releasing the camera, so resume() can restart it later."""
+        self._want_recording = False
+        self._stop_segment()
 
     def tick(self):
         """Call once per frame/loop iteration while running; rolls over into a new
-        segment file every SEGMENT_SECONDS."""
-        if not self.enabled or self._picam2 is None:
+        segment file every SEGMENT_SECONDS -- and retries on that same schedule if
+        the last _start_segment() attempt failed (e.g. low disk space)."""
+        if self._picam2 is None or not self._want_recording:
             return
         if time.monotonic() - self._segment_start >= SEGMENT_SECONDS:
             self._stop_segment()
@@ -51,6 +71,7 @@ class VideoRecorder:
 
     def stop(self):
         if self._picam2 is not None:
+            self._want_recording = False
             self._stop_segment()
             self._picam2 = None
             self._segment_start = None

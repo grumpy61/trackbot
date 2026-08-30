@@ -78,6 +78,7 @@ def mainloop(tracker, motor, start_mode="follow_ball", debug=False):
     sensors = SensorHub()
     mode = Mode[start_mode.upper()]
     last_debug_msg = None
+    last_recording_state = tracker.video_recorder.recording
 
     def debug_print(msg):
         nonlocal last_debug_msg
@@ -98,6 +99,16 @@ def mainloop(tracker, motor, start_mode="follow_ball", debug=False):
             command = controller.poll()
             if command is not None:
                 command_handler.process_command(command)
+            command_handler.tick()  # ease throttle toward its target, independent of new events
+
+            if command_handler.recording != last_recording_state:
+                last_recording_state = command_handler.recording
+                if command_handler.recording:
+                    print("[mainloop] K pressed -> resuming video recording")
+                    tracker.video_recorder.resume()
+                else:
+                    print("[mainloop] K pressed -> pausing video recording")
+                    tracker.video_recorder.pause()
 
             sensors.read()  # TODO: react to sensor state (e.g. obstacle stop) once wired up
 
