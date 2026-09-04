@@ -18,7 +18,7 @@ import time
 from pathlib import Path
 
 from picamera2.encoders import H264Encoder
-from picamera2.outputs import FfmpegOutput
+from picamera2.outputs import PyavOutput
 
 VIDEO_DIR = Path("/home/trackbot/Videos/Trackbot")
 SEGMENT_SECONDS = 5 * 60  # restart into a new file after this long
@@ -26,10 +26,12 @@ MIN_FREE_BYTES = 50 * 1024 ** 3  # don't record if less than this much free spac
 
 
 class VideoRecorder:
-    """enabled controls only whether recording auto-starts in start(); the camera
-    reference is kept either way, so resume()/pause() can toggle recording on or
-    off at runtime (e.g. from a manual key-press command) regardless of how it
-    started."""
+    """enabled just records the caller's intent to auto-record (--record-preview);
+    start() itself never begins recording -- starting the encoder here, before the
+    camera/mainloop has settled, was observed to hang the whole program. The camera
+    reference is kept either way, so resume()/pause() can toggle recording on or off
+    at runtime (e.g. once the mainloop is running, or from a manual key-press
+    command) regardless of how it started."""
 
     def __init__(self, enabled=True):
         self.enabled = enabled
@@ -44,8 +46,6 @@ class VideoRecorder:
 
     def start(self, picam2):
         self._picam2 = picam2
-        if self.enabled:
-            self.resume()
 
     def resume(self):
         """Start (or restart) recording. No-op if already recording or start() hasn't run."""
@@ -91,7 +91,11 @@ class VideoRecorder:
 
         timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         path = VIDEO_DIR / f"trackbot_{timestamp}.mp4"
-        self._picam2.start_recording(H264Encoder(), FfmpegOutput(str(path)))
+        # PyavOutput muxes directly via libav (PyAV) in-process, rather than piping the
+        # encoded stream out to a separate `ffmpeg` subprocess over stdin like FfmpegOutput
+        # did -- that pipe was consistently getting invalid data ("Error opening input
+        # file -." from ffmpeg) on this setup, every time recording started.
+        self._picam2.start_recording(H264Encoder(), PyavOutput(str(path)))
         self._recording = True
         self._segment_start = time.monotonic()
         print(f"[VideoRecorder] Recording to {path}")

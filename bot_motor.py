@@ -88,6 +88,13 @@ class BotMotor:
         self.left.set_speed(_clamp(throttle + steering))
         self.right.set_speed(_clamp(throttle - steering))
 
+    def drive_lr(self, left=0.0, right=0.0):
+        """Set left/right track speeds directly (already-mixed, e.g. by
+        BotCommandHandler.left/right's asymmetric steering), bypassing the
+        throttle +/- steering mix that drive() uses."""
+        self.left.set_speed(_clamp(left))
+        self.right.set_speed(_clamp(right))
+
     def stop(self):
         self.left.stop()
         self.right.stop()

@@ -19,10 +19,11 @@ else
 fi
 
 source venv.sh
+sleep 1
 
 echo
-echo "=== starting run_trackbot.py ==="
+echo "Starting run_trackbot.py"
 python3 run_trackbot.py --show-preview --record-preview
-echo "=== run_trackbot.py exited (status $?) ==="
+echo "run_trackbot.py exited (status $?)"
 
 exec bash

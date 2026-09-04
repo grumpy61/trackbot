@@ -14,88 +14,133 @@ from evdev import ecodes
 # This gamepad's D-pad shows up as plain keyboard keycodes rather than BTN_DPAD_*/
 # ABS_HAT0X,Y -- confirmed by testing: UP sends 'c', DOWN sends 'd', LEFT sends 'e',
 # RIGHT sends 'f', and the "stop" button sends 'g'.
-KEY_UP = ecodes.KEY_C
-KEY_DOWN = ecodes.KEY_D
-KEY_LEFT = ecodes.KEY_E
-KEY_RIGHT = ecodes.KEY_F
-KEY_STOP = ecodes.KEY_G
-KEY_DECEL = ecodes.KEY_H  # drops throttle by one ramp step and zeroes steering
-KEY_RECORD_TOGGLE = ecodes.KEY_K  # toggles video recording on/off
 
-# A K press within this long of the previous K press counts as a "quick click":
-# instead of toggling again, it forces recording off. So a single press toggles
-# normally, but two or more rapid presses always end up off, regardless of parity.
-RECORD_QUICK_CLICK_WINDOW_S = 0.6
+# 4 direction arrows
+BTN_UP = ecodes.KEY_C
+BTN_DOWN = ecodes.KEY_D
+BTN_LEFT = ecodes.KEY_E
+BTN_RIGHT = ecodes.KEY_F
 
-# Step size range for easing steering (and throttle's ease-back-to-zero) toward
-# the D-pad's target each time process_command() runs: near zero (gentle start/
-# fine control), larger steps further out (faster ramp once already moving).
-MIN_STEP = 0.15
-MAX_STEP = 0.35
+# X, Y, A, B buttons
+BTN_A_STOP = ecodes.KEY_G
+BTN_X_STRAIGHT = ecodes.KEY_H           # Zero steering
+BTN_L_RECORD_TOGGLE = ecodes.KEY_K      # Video recording on/off
+BTN_R_FOLLOW_TOGGLE = ecodes.KEY_M      # Ball-following (Mode.FOLLOW_BALL) on/off
 
-# Throttle ramp, tuned against the physical bot: the old uniform stepping (using
-# MIN_STEP/MAX_STEP from a stop) put the bot at ~0.55 after 3 presses and had it
-# saturated at the 1.0 ceiling by the 5th-6th -- but the bot doesn't actually
-# move until the 3rd fwd press (lower values don't clear the motor's deadband).
-# So: stay at 0 for the first two presses, jump straight to the deadband-clearing
-# floor on the 3rd (matching where the old stepping landed by press 3), then ramp
-# up to the 1.0 speed limit (matching where the old stepping had already
-# saturated by press 6) over further presses -- 6-8 presses stop-to-max overall.
-THROTTLE_DEAD_PRESSES = 2   # presses with the bot held at 0 before the floor kicks in
-THROTTLE_FLOOR = 0.55       # value assigned on the press that first clears the deadband
-THROTTLE_MAX = 1.0          # speed limit / ceiling
-THROTTLE_RAMP_PRESSES = 7   # further presses from floor to max (2 dead + 1 floor + 7 = 10 total)
+# A press of a toggle button (recording, follow-ball) within this long of its own
+# previous press counts as a "quick click": instead of toggling again, it forces
+# that toggle off. So a single press toggles normally, but two or more rapid
+# presses always end up off, regardless of parity. See _QuickClickToggle.
+QUICK_CLICK_WINDOW_S = 0.6
+
+# Holding STOP continuously this long requests a clean program shutdown. Checked
+# in check_shutdown_hold(), which needs the gamepad's *live* button state (not
+# just new events) since this device doesn't send repeat events while held --
+# see run_trackbot.py's mainloop, which calls it every iteration with
+# controller.state.buttons.
+STOP_HOLD_SHUTDOWN_S = 3.0
+
+# Throttle and steering are both a ratchet: each press of the relevant key steps
+# the target up by one rung (see _update_throttle_target/_update_steering_raw),
+# and releasing the key just holds at the current rung rather than decaying back
+# toward zero. Only an explicit opposite-direction press, DECEL, or STOP moves it
+# back down -- otherwise a release between taps (which is how repeated presses
+# necessarily arrive) would keep undoing progress, and it'd take holding the key
+# down (for the device's own key-repeat events) to ever get anywhere.
+
+# Throttle ramp, tuned against the physical bot: the bot doesn't actually move
+# until the 3rd fwd press (lower values don't clear the motor's deadband). So:
+# stay at 0 for the first two presses, jump straight to the deadband-clearing
+# floor on the 3rd, then ramp up to the 1.0 speed limit over further presses --
+# 20 presses (steps) stop-to-max overall.
+THROTTLE_DEAD_PRESSES = 2    # presses with the bot held at 0 before the floor kicks in
+THROTTLE_FLOOR = 0.35        # value assigned on the press that first clears the deadband (0.55 * 0.7)
+THROTTLE_MAX = 1.0           # speed limit / ceiling
+THROTTLE_RAMP_PRESSES = 17   # further presses from floor to max (2 dead + 1 floor + 17 = 20 total)
 THROTTLE_RAMP_STEP = (THROTTLE_MAX - THROTTLE_FLOOR) / THROTTLE_RAMP_PRESSES
 
 # A ramp/decel press changes the *target* throttle instantly, but jumping the
-# motor's actual output straight there (e.g. the 0 -> 0.55 floor jump) is an
-# abrupt jolt. Smooth it out into small steps paced by wall-clock time (via
+# motor's actual output straight there (e.g. the 0 -> THROTTLE_FLOOR floor jump)
+# is an abrupt jolt. Smooth it out into small steps paced by wall-clock time (via
 # tick(), called every mainloop iteration) instead of one big jump per press.
-THROTTLE_SMOOTH_INTERVAL_S = 0.05
-THROTTLE_SMOOTH_STEP = 0.05
+THROTTLE_SMOOTH_INTERVAL_S = 0.5
+THROTTLE_SMOOTH_STEP = 0.5
 
-# Steering authority shrinks as throttle climbs toward THROTTLE_MAX -- a full
-# hard-over turn at a stop is fine, but the same input at top speed should only
-# be a gentle nudge. STEERING_MAX is the full-lock value available at a stop;
-# it scales linearly down to STEERING_MIN_FRACTION of that (25%) by the time
-# throttle reaches THROTTLE_MAX.
 STEERING_MAX = 1.0
-STEERING_MIN_FRACTION = 0.25
 
 # Steering ramps up from center the same way throttle ramps up from a stop: a
 # fixed number of presses (no dead presses/floor jump -- steering has no
 # deadband to clear) spread evenly from 0 to STEERING_MAX.
-STEERING_RAMP_PRESSES = 10
+STEERING_RAMP_PRESSES = 20
 STEERING_RAMP_STEP = STEERING_MAX / STEERING_RAMP_PRESSES
 
+# The naive differential-drive mix (left = throttle + steering, right = throttle
+# - steering) raises one track and lowers the other by equal amounts, which can
+# drive the lowered track to zero or into reverse -- an unintended spin rather
+# than a turn. Instead, BotCommandHandler.left/right only ever *lower* the
+# inside track toward zero (the outside track always stays at self.throttle,
+# never raised above it), capped so the two tracks can never differ by more
+# than MOTOR_DIFF_MAX_STEPS throttle steps, regardless of how much steering is
+# applied.
+MOTOR_DIFF_MAX_STEPS = 2
+THROTTLE_TOTAL_PRESSES = THROTTLE_DEAD_PRESSES + 1 + THROTTLE_RAMP_PRESSES  # zero to full throttle
+THROTTLE_STEP = THROTTLE_MAX / THROTTLE_TOTAL_PRESSES
+MOTOR_DIFF_MAX = MOTOR_DIFF_MAX_STEPS * THROTTLE_STEP
 
-def _step_toward(current, target):
-    if current == target:
-        return current
-    step = MIN_STEP + (MAX_STEP - MIN_STEP) * abs(current)
 
-    if target == 0.0:
-        # If target is zero, we want to ease back to zero more slowly the normal
-        # step size would allow, so decrease the step size.
-        step *= 0.1
+def _reduce_toward_zero(value, amount):
+    """Move value toward 0 by amount, without crossing past 0."""
+    if value > 0:
+        return max(0.0, value - amount)
+    if value < 0:
+        return min(0.0, value + amount)
+    return 0.0
 
-    if target > current:
-        return min(target, current + step)
-    return max(target, current - step)
+
+class _QuickClickToggle:
+    """A single press toggles on/off; a press within QUICK_CLICK_WINDOW_S of the
+    previous one instead forces off, so a burst of quick clicks always ends off
+    regardless of how many presses it contains."""
+
+    def __init__(self):
+        self.on = False
+        self._was_down = False
+        self._last_press_time = None
+
+    def update(self, key_down):
+        """Call once per process_command() with the button's current down state;
+        returns the (possibly updated) on/off state."""
+        if key_down and not self._was_down:
+            # Fires once per physical press, not while held or on release.
+            now = time.monotonic()
+            if (self._last_press_time is not None
+                    and now - self._last_press_time <= QUICK_CLICK_WINDOW_S):
+                self.on = False
+            else:
+                self.on = not self.on
+            self._last_press_time = now
+        self._was_down = key_down
+        return self.on
+
+    def force_off(self):
+        self.on = False
+
+    def force_on(self):
+        self.on = True
 
 
 class BotCommandHandler:
     """Owns the mapping from raw gamepad state to bot behavior.
 
-    throttle/steering ease toward the D-pad's current up/down/left/right state
-    (-1.0..1.0 each) rather than jumping straight there, for a caller in Mode.MANUAL
-    to feed into BotMotor.drive().
+    throttle/steering ratchet toward the D-pad's current up/down/left/right state
+    (-1.0..1.0 each) one rung per press rather than jumping straight there. A
+    caller in Mode.MANUAL reads left/right (not throttle/steering directly) to
+    feed into BotMotor.drive_lr().
     """
 
     def __init__(self):
         self.throttle = 0.0
         self.steering = 0.0
-        self.recording = False
         self._steering_raw = 0.0  # stepped toward the D-pad target, before the speed-based clamp
         self._steering_press_count = 0
         self._steering_press_dir = 0
@@ -103,17 +148,49 @@ class BotCommandHandler:
         self._throttle_press_count = 0
         self._throttle_press_dir = 0
         self._last_smooth_time = time.monotonic()
-        self._record_key_was_down = False
-        self._last_record_press_time = None
+        self._recording_toggle = _QuickClickToggle()
+        self._follow_toggle = _QuickClickToggle()
+        self.shutdown_requested = False
+        self._stop_hold_start = None
+
+    @property
+    def recording(self):
+        return self._recording_toggle.on
+
+    @property
+    def follow_ball(self):
+        return self._follow_toggle.on
+
+    def begin_recording(self):
+        """Force recording on, e.g. for a deferred --record-preview auto-start.
+        Leaves it toggle-able (including quick-click-off) afterward, same as if
+        the record button itself had just been pressed."""
+        self._recording_toggle.force_on()
+
+    def check_shutdown_hold(self, buttons):
+        """Call every mainloop iteration with the gamepad's live button state
+        (e.g. controller.state.buttons, not just process_command()'s events) --
+        sets shutdown_requested once STOP has been held continuously for
+        STOP_HOLD_SHUTDOWN_S."""
+        if buttons.get(BTN_A_STOP, False):
+            if self._stop_hold_start is None:
+                self._stop_hold_start = time.monotonic()
+            elif time.monotonic() - self._stop_hold_start >= STOP_HOLD_SHUTDOWN_S:
+                self.shutdown_requested = True
+        else:
+            self._stop_hold_start = None
 
     def process_command(self, command):
         """command is a bot_gamepad.GamepadState (buttons + axes dicts)."""
         buttons = command.buttons
 
-        self._handle_record_toggle(buttons)
+        self._recording_toggle.update(buttons.get(BTN_L_RECORD_TOGGLE, False))
+        self._follow_toggle.update(buttons.get(BTN_R_FOLLOW_TOGGLE, False))
 
-        if buttons.get(KEY_STOP, False):
+        if buttons.get(BTN_A_STOP, False):
             # Immediate stop/zero, bypassing the eased ramp and the smoothing below.
+            # Also drops back out of FOLLOW_BALL -- an emergency stop should hand
+            # control back to the human, not leave the bot driving itself.
             self.throttle = 0.0
             self._throttle_target = 0.0
             self.steering = 0.0
@@ -122,49 +199,57 @@ class BotCommandHandler:
             self._throttle_press_dir = 0
             self._steering_press_count = 0
             self._steering_press_dir = 0
+            self._follow_toggle.force_off()
             return
 
-        if buttons.get(KEY_DECEL, False):
-            self._drop_throttle_step()
+        if buttons.get(BTN_X_STRAIGHT, False):
+            # self._drop_throttle_step()
             self.steering = 0.0
             self._steering_raw = 0.0
             self._steering_press_count = 0
             self._steering_press_dir = 0
             return
 
-        up = buttons.get(KEY_UP, False)
-        down = buttons.get(KEY_DOWN, False)
-        left = buttons.get(KEY_LEFT, False)
-        right = buttons.get(KEY_RIGHT, False)
+        up = buttons.get(BTN_UP, False)
+        down = buttons.get(BTN_DOWN, False)
+        left = buttons.get(BTN_LEFT, False)
+        right = buttons.get(BTN_RIGHT, False)
 
         throttle_target = float(up) - float(down)
         steering_target = float(right) - float(left)
 
         self._update_throttle_target(throttle_target)
         self._update_steering_raw(steering_target)
-        self.steering = self._clamp_steering(self._steering_raw)
+        self.steering = self._steering_raw
 
-    def _handle_record_toggle(self, buttons):
-        key_down = buttons.get(KEY_RECORD_TOGGLE, False)
-        if key_down and not self._record_key_was_down:
-            # Fires once per physical press, not while held or on release.
-            now = time.monotonic()
-            if (self._last_record_press_time is not None
-                    and now - self._last_record_press_time <= RECORD_QUICK_CLICK_WINDOW_S):
-                self.recording = False
-            else:
-                self.recording = not self.recording
-            self._last_record_press_time = now
-        self._record_key_was_down = key_down
+    @property
+    def left(self):
+        return self._motor_lr()[0]
+
+    @property
+    def right(self):
+        return self._motor_lr()[1]
+
+    def _motor_lr(self):
+        """Differential-drive mix for BotMotor.drive_lr(): the outside track always
+        stays at self.throttle (never raised above it); the inside track (picked by
+        steering's sign) is lowered toward zero by one THROTTLE_STEP per steering
+        press, capped at MOTOR_DIFF_MAX_STEPS presses -- so the first couple of
+        steering presses have an immediately noticeable effect, and the two tracks
+        never differ by more than MOTOR_DIFF_MAX_STEPS throttle steps no matter how
+        many more presses follow (steering's own 20-press ramp is finer than this,
+        but past MOTOR_DIFF_MAX_STEPS presses it no longer changes the motor mix)."""
+        diff_magnitude = min(MOTOR_DIFF_MAX_STEPS, self._steering_press_count) * THROTTLE_STEP
+        inside = _reduce_toward_zero(self.throttle, diff_magnitude)
+        if self.steering >= 0:
+            return self.throttle, inside  # steering right -> right track is inside
+        return inside, self.throttle  # steering left -> left track is inside
 
     def tick(self):
         """Nudge the actual throttle output toward _throttle_target, at most once
         every THROTTLE_SMOOTH_INTERVAL_S. Call this every mainloop iteration
         (independent of new gamepad events) so a ramp/decel step's target change
-        arrives gradually instead of snapping the motor straight there. Also
-        re-clamps steering against the current throttle, so steering authority
-        shrinks in step as the throttle ramp climbs -- not just on the next
-        steering key press."""
+        arrives gradually instead of snapping the motor straight there."""
         now = time.monotonic()
         if now - self._last_smooth_time < THROTTLE_SMOOTH_INTERVAL_S:
             return
@@ -175,17 +260,12 @@ class BotCommandHandler:
         elif self.throttle > self._throttle_target:
             self.throttle = max(self._throttle_target, self.throttle - THROTTLE_SMOOTH_STEP)
 
-        self.steering = self._clamp_steering(self._steering_raw)
-
     def _update_steering_raw(self, target):
         direction = 0 if target == 0.0 else (1 if target > 0.0 else -1)
 
         if direction == 0:
-            # Released -- ease back down to center and reset the press count so
-            # the next left/right press starts the ramp over.
-            self._steering_press_count = 0
-            self._steering_press_dir = 0
-            self._steering_raw = _step_toward(self._steering_raw, 0.0)
+            # Released -- ratchet holds at the current rung (see the module-level
+            # comment); only an opposite-direction press or STOP brings it back.
             return
 
         if direction != self._steering_press_dir:
@@ -196,24 +276,13 @@ class BotCommandHandler:
         self._steering_press_count += 1
         self._steering_raw = direction * min(STEERING_MAX, STEERING_RAMP_STEP * self._steering_press_count)
 
-    def _clamp_steering(self, value):
-        limit = self._max_steering()
-        return max(-limit, min(limit, value))
-
-    def _max_steering(self):
-        fraction_of_top_speed = min(1.0, abs(self.throttle) / THROTTLE_MAX)
-        return STEERING_MAX * (1.0 - fraction_of_top_speed * (1.0 - STEERING_MIN_FRACTION))
-
     def _update_throttle_target(self, target):
+        """ target is the desired throttle direction as negative (-1.0), 0, or positive (1.0) """
         direction = 0 if target == 0.0 else (1 if target > 0.0 else -1)
 
         if direction == 0:
-            # Released -- ease back down to a stop and reset the press count so
-            # the next fwd/back press starts the dead-press count over.
-            self._throttle_press_count = 0
-            self._throttle_press_dir = 0
-            self.throttle = _step_toward(self.throttle, 0.0)
-            self._throttle_target = self.throttle
+            # Released -- ratchet holds at the current rung (see the module-level
+            # comment); only DECEL or STOP brings the throttle back down.
             return
 
         if direction != self._throttle_press_dir:

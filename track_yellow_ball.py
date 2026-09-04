@@ -71,17 +71,18 @@ class TrackResult:
 
 
 class Detection:
-    def __init__(self, coords, category, conf, metadata, imx500, picam2, frame_size):
+    def __init__(self, coords, category, conf, metadata, imx500, picam2):
         self.category = category
         self.conf = conf
-        x, y, w, h = imx500.convert_inference_coords(coords, metadata, picam2)
-        # The camera is mounted upside down, so YellowBallTracker.start() applies a
-        # 180deg Transform to the ISP output (preview/color-check/overlay all see a
-        # right-side-up image). But the on-sensor NN computes boxes on the raw,
-        # pre-transform sensor frame, and convert_inference_coords doesn't know about
-        # the transform -- so flip the box here to match the corrected image.
-        frame_w, frame_h = frame_size
-        self.box = (frame_w - x - w, frame_h - y - h, w, h)
+        # convert_inference_coords() maps the on-sensor NN's coords into the "main"
+        # stream's coordinate space, and empirically (confirmed against the physical
+        # bot) that space already matches what pre_callback/draw_overlay draws onto --
+        # regardless of any hflip/vflip Transform applied for display -- so no manual
+        # correction is needed here. (An earlier version of this code flipped the box
+        # to "correct" for the Transform, which actually double-flipped it: with the
+        # camera upside down, the overlay landed on the exact opposite corner from the
+        # real ball.)
+        self.box = imx500.convert_inference_coords(coords, metadata, picam2)
 
 
 class YellowBallTracker:
@@ -103,6 +104,7 @@ class YellowBallTracker:
         debug=False,
         show_preview=False,
         record_preview=False,
+        upside_down=False,
     ):
         self.class_name = class_name
         self.threshold = threshold
@@ -113,6 +115,7 @@ class YellowBallTracker:
         self.color_space = color_space
         self.debug = debug
         self.show_preview = show_preview
+        self.upside_down = upside_down
         self.video_recorder = VideoRecorder(enabled=record_preview)
 
         model_config = MODEL_CONFIGS[model]
@@ -161,7 +164,7 @@ class YellowBallTracker:
         self.picam2 = Picamera2(self.imx500.camera_num)
         config = self.picam2.create_preview_configuration(
             controls={"FrameRate": self.intrinsics.inference_rate}, buffer_count=12,
-            transform=Transform(hflip=True, vflip=True),  # camera is mounted upside down
+            transform=Transform(hflip=self.upside_down, vflip=self.upside_down),
         )
         self.imx500.show_network_fw_progress_bar()
         self.picam2.start(config, show_preview=self.show_preview)
@@ -239,9 +242,8 @@ class YellowBallTracker:
             f"DEBUG: best '{self.class_name}' score={best_target_score:.3f} (threshold={self.threshold})"
         )
 
-        frame_size = (self.frame_w, self.frame_h)
         self.last_detections = [
-            Detection(box, category, score, metadata, self.imx500, self.picam2, frame_size)
+            Detection(box, category, score, metadata, self.imx500, self.picam2)
             for box, score, category in zip(boxes, scores, classes)
             if score > self.threshold
         ]
@@ -348,6 +350,8 @@ def get_args():
     parser.add_argument("--debug", action="store_true", help="Print verbose per-frame debug info")
     parser.add_argument("--record-preview", action=argparse.BooleanOptionalAction, default=False,
                          help="Record camera video to ~/Videos/Trackbot (default: off)")
+    parser.add_argument("--upside-down", action=argparse.BooleanOptionalAction, default=False,
+                         help="Camera is mounted upside down, so flip h/v (default: off")
     return parser.parse_args()
 
 
@@ -379,6 +383,7 @@ if __name__ == "__main__":
             debug=args.debug,
             show_preview=args.show_preview,
             record_preview=args.record_preview,
+            upside_down=args.upside_down,
         )
     except (ValueError, RuntimeError) as e:
         print("Error initializing YellowBallTracker:", file=sys.stderr)
