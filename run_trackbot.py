@@ -17,6 +17,7 @@ Usage:
 """
 
 import argparse
+import subprocess
 import sys
 import time
 from enum import Enum, auto
@@ -26,6 +27,7 @@ from bot_gamepad import BTGamepadController
 from bot_motor import BotMotor
 from plain_camera import PlainCameraViewer
 from track_yellow_ball import YellowBallTracker
+from trackbot_audio import TrackbotAudio
 
 
 class Mode(Enum):
@@ -45,12 +47,40 @@ class SensorHub:
 FOLLOW_TARGET_SIZE_FRAC = 0.05  # ball size (box area / frame area) we're aiming to hold at
 FOLLOW_MAX_THROTTLE = 0.4  # conservative cap until this is tuned on real hardware
 
+# Ball within this much of center (normalized dx, 0..1) is treated as "centered"
+# -- no steering correction at all, rather than constantly micro-steering at the
+# slightest offset. Beyond the deadband, steering is rescaled back up to still
+# reach full lock at the frame edge (dx = +/-1), so there's no jump at the edge
+# of the zone. dx = +/-1 spans center-to-edge (half the frame width) each way,
+# so this threshold value doubles as the deadband's total width as a fraction
+# of the FULL frame width -- 0.20 here means a zone ~20% of the screen wide.
+FOLLOW_CENTER_DEADBAND = 0.20
+
+BALL_SOUND_PATH = "./sounds/ball.wav"  # played when a new ball is detected
+BALL_SOUND_COOLDOWN_S = 5.0  # don't replay the sound more often than this
+
+GAMEPAD_CONNECTED_SOUND_PATH = "./sounds/gamepadconnected.wav"
+GAMEPAD_DISCONNECTED_SOUND_PATH = "./sounds/gamepadnotfound.wav"
+
+VIDEO_ON_SOUND_PATH = "./sounds/videoison.wav"
+VIDEO_OFF_SOUND_PATH = "./sounds/videoisoff.wav"
+
+SHUTDOWN_SOUND_PATH = "./sounds/shuttingdown.wav"
+
+
+def _follow_ball_steering(dx):
+    if abs(dx) <= FOLLOW_CENTER_DEADBAND:
+        return 0.0
+    sign = 1.0 if dx > 0.0 else -1.0
+    return sign * (abs(dx) - FOLLOW_CENTER_DEADBAND) / (1.0 - FOLLOW_CENTER_DEADBAND)
+
 
 def _follow_ball_throttle_steering(result):
-    """First-pass proportional control law: steer toward the ball's dx, move forward
-    proportional to how much smaller than FOLLOW_TARGET_SIZE_FRAC the box is, and stop
-    (no reverse) once it's at/above target size. Needs tuning on real hardware."""
-    steering = result.dx
+    """First-pass proportional control law: steer toward the ball's dx (once outside
+    the FOLLOW_CENTER_DEADBAND), move forward proportional to how much smaller than
+    FOLLOW_TARGET_SIZE_FRAC the box is, and stop (no reverse) once it's at/above
+    target size. Needs tuning on real hardware."""
+    steering = _follow_ball_steering(result.dx)
     gap = (FOLLOW_TARGET_SIZE_FRAC - result.size_frac) / FOLLOW_TARGET_SIZE_FRAC
     throttle = max(0.0, min(1.0, gap)) * FOLLOW_MAX_THROTTLE
     return throttle, steering
@@ -84,6 +114,7 @@ RECORD_AUTOSTART_DELAY_S = 1.0
 
 
 def mainloop(tracker, motor, start_mode="manual", debug=False):
+    audio = TrackbotAudio()
     controller = BTGamepadController(verbose=debug)
     command_handler = BotCommandHandler()
     sensors = SensorHub()
@@ -91,8 +122,17 @@ def mainloop(tracker, motor, start_mode="manual", debug=False):
     last_debug_msg = None
     last_recording_state = tracker.video_recorder.recording
     last_follow_state = command_handler.follow_ball
+    last_mode = base_mode  # for logging entering/leaving ball tracking mode below
     mainloop_start_time = time.monotonic()
     pending_record_autostart = tracker.video_recorder.enabled  # --record-preview was passed
+    ball_was_found = False
+    last_ball_sound_time = -BALL_SOUND_COOLDOWN_S  # so the very first detection can play
+
+    # Announce the gamepad's connection state as of startup, then again on every
+    # change (BTGamepadController.poll() reconnects/disconnects automatically).
+    gamepad_was_connected = controller.device is not None
+    print(f"[mainloop] Gamepad {'connected' if gamepad_was_connected else 'not connected'} at startup")
+    audio.play(GAMEPAD_CONNECTED_SOUND_PATH if gamepad_was_connected else GAMEPAD_DISCONNECTED_SOUND_PATH)
 
     # PlainCameraViewer.tick() never finds anything -- no AI camera is attached, so
     # FOLLOW_BALL can't do anything but spam "ball not found". Block the toggle from
@@ -112,6 +152,12 @@ def mainloop(tracker, motor, start_mode="manual", debug=False):
                 command_handler.process_command(command)
             command_handler.tick()  # ease throttle toward its target, independent of new events
 
+            gamepad_connected = controller.device is not None
+            if gamepad_connected != gamepad_was_connected:
+                gamepad_was_connected = gamepad_connected
+                print(f"[mainloop] Gamepad {'connected' if gamepad_connected else 'disconnected'}")
+                audio.play(GAMEPAD_CONNECTED_SOUND_PATH if gamepad_connected else GAMEPAD_DISCONNECTED_SOUND_PATH)
+
             # Uses the gamepad's live state, not just new events, since this device
             # doesn't send repeat events while a button is held down.
             command_handler.check_shutdown_hold(controller.state.buttons)
@@ -130,31 +176,44 @@ def mainloop(tracker, motor, start_mode="manual", debug=False):
                 if command_handler.recording:
                     print("[mainloop] resuming video recording")
                     tracker.video_recorder.resume()
+                    audio.play(VIDEO_ON_SOUND_PATH)
                 else:
                     print("[mainloop] pausing video recording")
                     tracker.video_recorder.pause()
+                    audio.play(VIDEO_OFF_SOUND_PATH)
 
             if command_handler.follow_ball != last_follow_state:
                 last_follow_state = command_handler.follow_ball
-                if not command_handler.follow_ball:
-                    print("[mainloop] M pressed -> FOLLOW_BALL off")
-                elif follow_ball_available:
-                    print("[mainloop] M pressed -> FOLLOW_BALL on")
-                else:
-                    print("[mainloop] M pressed -> FOLLOW_BALL requested, but no AI camera "
+                if command_handler.follow_ball and not follow_ball_available:
+                    print("[mainloop] Right trigger pressed -> FOLLOW_BALL requested, but no AI camera "
                           f"available -- staying in {base_mode.name}")
 
             mode = Mode.FOLLOW_BALL if (command_handler.follow_ball and follow_ball_available) else base_mode
+
+            # Always log the actual mode boundary being crossed (not just the button
+            # press above), so this stays correct regardless of what triggers a change.
+            if mode != last_mode:
+                if mode is Mode.FOLLOW_BALL:
+                    print("[mainloop] Entering ball tracking mode")
+                else:
+                    print(f"[mainloop] Leaving ball tracking mode -> {mode.name}")
+                last_mode = mode
 
             sensors.read()  # TODO: react to sensor state (e.g. obstacle stop) once wired up
 
             if mode is Mode.FOLLOW_BALL:
                 result = tracker.tick()
                 if result is not None:
+                    if not ball_was_found and time.monotonic() - last_ball_sound_time >= BALL_SOUND_COOLDOWN_S:
+                        last_ball_sound_time = time.monotonic()
+                        audio.play(BALL_SOUND_PATH)
+                    ball_was_found = True
+
                     throttle, steering = _follow_ball_throttle_steering(result)
                     debug_print(f"[mainloop] FOLLOW_BALL: motor.drive(throttle={throttle:.3f}, steering={steering:.3f})")
                     motor.drive(throttle=throttle, steering=steering)
                 else:
+                    ball_was_found = False
                     debug_print("[mainloop] FOLLOW_BALL: ball not found -> motor.stop()")
                     motor.stop()
             elif mode is Mode.MANUAL:
@@ -173,8 +232,47 @@ def mainloop(tracker, motor, start_mode="manual", debug=False):
         pass
     finally:
         motor.stop()
+        print("[mainloop] Shutting down")
+        audio.play(SHUTDOWN_SOUND_PATH)
+        audio.wait_for_sound(timeout=4)
         motor.close()
         tracker.stop()
+        audio.close()
+
+
+def _log_network_status():
+    """Best-effort: log which network interfaces (wifi/ethernet) are connected,
+    to what, and the device's IP address(es) -- useful from the startup log for
+    diagnosing "why can't I SSH/VNC in" without needing a monitor on the bot.
+    Never raises -- a missing nmcli or no network at all is just logged, not fatal."""
+    try:
+        result = subprocess.run(
+            ["nmcli", "-t", "-f", "DEVICE,TYPE,STATE,CONNECTION", "device", "status"],
+            capture_output=True, text=True, timeout=5,
+        )
+        connected = []
+        for line in result.stdout.strip().splitlines():
+            parts = line.split(":")
+            if len(parts) < 4:
+                continue
+            device, dev_type, state = parts[0], parts[1], parts[2]
+            connection = ":".join(parts[3:])  # connection names could contain ':'
+            if dev_type in ("wifi", "ethernet") and state == "connected":
+                connected.append(f'{dev_type} {device} -> "{connection}"')
+        if connected:
+            print(f"[network] Connected: {', '.join(connected)}")
+        else:
+            print("[network] No wifi/ethernet connection detected.")
+    except (OSError, subprocess.SubprocessError) as e:
+        print(f"[network] nmcli check failed: {e}", file=sys.stderr)
+
+    try:
+        ip_result = subprocess.run(["hostname", "-I"], capture_output=True, text=True, timeout=5)
+        ips = ip_result.stdout.split()
+        if ips:
+            print(f"[network] IP address(es): {', '.join(ips)}")
+    except (OSError, subprocess.SubprocessError) as e:
+        print(f"[network] IP address check failed: {e}", file=sys.stderr)
 
 
 # Raised by IMX500(...) when no AI camera is attached. Checked explicitly below so an
@@ -221,6 +319,7 @@ def init(args):
 
 
 def main():
+    _log_network_status()
     args = get_args()
     tracker, motor = init(args)
     mainloop(tracker, motor, start_mode=args.start_mode, debug=args.debug)

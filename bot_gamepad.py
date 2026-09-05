@@ -10,6 +10,8 @@ poll() periodically re-scans and connects automatically once one shows up.
 """
 
 import select
+import subprocess
+import sys
 import time
 from dataclasses import dataclass, field
 
@@ -17,6 +19,27 @@ import evdev
 from evdev import categorize, ecodes
 
 RECONNECT_INTERVAL_S = 1.5  # how often to re-scan for a gamepad while disconnected
+
+
+def _ensure_bluetooth_powered_on():
+    """Best-effort: unblock Bluetooth via rfkill and power the adapter on via
+    bluetoothctl if it's currently off, so a paired gamepad can still connect
+    even if Bluetooth wasn't left on at the system level (e.g. after a reboot).
+    Failures here (tools missing, no adapter, etc.) are logged but don't stop
+    the program -- poll() just keeps failing to find a gamepad, as it already
+    does today when none is available."""
+    try:
+        subprocess.run(["rfkill", "unblock", "bluetooth"], capture_output=True, timeout=5)
+    except (OSError, subprocess.SubprocessError) as e:
+        print(f"[BTGamepadController] rfkill unblock failed: {e}", file=sys.stderr)
+
+    try:
+        status = subprocess.run(["bluetoothctl", "show"], capture_output=True, text=True, timeout=5)
+        if "Powered: no" in status.stdout:
+            print("[BTGamepadController] Bluetooth adapter is powered off -- powering on.")
+            subprocess.run(["bluetoothctl", "power", "on"], capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError) as e:
+        print(f"[BTGamepadController] bluetoothctl power-on check failed: {e}", file=sys.stderr)
 
 
 def find_gamepads():
@@ -45,6 +68,7 @@ class BTGamepadController:
     seconds and connects automatically once one shows up."""
 
     def __init__(self, verbose=False):
+        _ensure_bluetooth_powered_on()
         self.device = None
         self.state = GamepadState()
         self.verbose = verbose  # print each raw key/axis event to the console as it arrives

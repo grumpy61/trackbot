@@ -81,8 +81,11 @@ STEERING_RAMP_STEP = STEERING_MAX / STEERING_RAMP_PRESSES
 # inside track toward zero (the outside track always stays at self.throttle,
 # never raised above it), capped so the two tracks can never differ by more
 # than MOTOR_DIFF_MAX_STEPS throttle steps, regardless of how much steering is
-# applied.
-MOTOR_DIFF_MAX_STEPS = 2
+# applied. _reduce_toward_zero() already guarantees the inside track can be
+# brought all the way down to a stop but never past it into reverse, so this
+# cap is free to be generous -- it doesn't need to be small to stay safe. (An
+# earlier, much smaller cap of 2 steps made steering barely perceptible.)
+MOTOR_DIFF_MAX_STEPS = 16
 THROTTLE_TOTAL_PRESSES = THROTTLE_DEAD_PRESSES + 1 + THROTTLE_RAMP_PRESSES  # zero to full throttle
 THROTTLE_STEP = THROTTLE_MAX / THROTTLE_TOTAL_PRESSES
 MOTOR_DIFF_MAX = MOTOR_DIFF_MAX_STEPS * THROTTLE_STEP
@@ -238,7 +241,21 @@ class BotCommandHandler:
         steering presses have an immediately noticeable effect, and the two tracks
         never differ by more than MOTOR_DIFF_MAX_STEPS throttle steps no matter how
         many more presses follow (steering's own 20-press ramp is finer than this,
-        but past MOTOR_DIFF_MAX_STEPS presses it no longer changes the motor mix)."""
+        but past MOTOR_DIFF_MAX_STEPS presses it no longer changes the motor mix).
+
+        At a dead stop (throttle == 0) "lower the inside track" has nothing to
+        lower -- both tracks would stay pinned at 0 forever, no matter how much
+        steering is applied. So this is the one case where the outside track IS
+        allowed to rise off of self.throttle: it ramps up from 0 using repeated
+        steering presses, via the same dead-press/floor/ramp curve as forward
+        throttle (_throttle_magnitude), so pivoting in place takes about as many
+        presses to get moving as driving forward does."""
+        if self.throttle == 0.0 and self._steering_press_count > 0:
+            pivot = self._throttle_magnitude(self._steering_press_count)
+            if self.steering >= 0:
+                return pivot, 0.0  # steering right -> left track pivots, right stays still
+            return 0.0, pivot  # steering left -> right track pivots, left stays still
+
         diff_magnitude = min(MOTOR_DIFF_MAX_STEPS, self._steering_press_count) * THROTTLE_STEP
         inside = _reduce_toward_zero(self.throttle, diff_magnitude)
         if self.steering >= 0:
