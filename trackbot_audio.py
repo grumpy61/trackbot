@@ -21,6 +21,7 @@ from pathlib import Path
 
 DEFAULT_PLAYER_CMD = "pw-play"
 PLAYBACK_VOLUME = 0.9  # 0-1.0, passed to pw-play's --volume for every clip
+PAUSE_SOUND_PATH = Path(__file__).parent / "sounds" / "silentonesec.wav"  # 1s of silence
 
 _STOP = object()  # sentinel put on the queue to shut the worker thread down
 
@@ -41,13 +42,21 @@ class TrackbotAudio:
         self._worker = threading.Thread(target=self._run, daemon=True)
         self._worker.start()
 
-    def play(self, path):
-        """Stop current playback, clear the queue, and play path now."""
+    def play(self, path, pause_after=False):
+        """Stop current playback, clear the queue, and play path now. If
+        pause_after, queue a 1s silence clip right behind it."""
         self.stop()
-        self.queue(path)
+        self.queue(path, pause_after=pause_after)
 
-    def queue(self, path):
-        """Append path to play once everything ahead of it finishes."""
+    def queue(self, path, pause_after=False):
+        """Append path to play once everything ahead of it finishes. If
+        pause_after, also queue a 1s silence clip right behind it, so whatever
+        plays next (from this call or a later one) doesn't run straight on."""
+        self._queue_one(path)
+        if pause_after:
+            self._queue_one(PAUSE_SOUND_PATH)
+
+    def _queue_one(self, path):
         path = Path(path)
         if not path.is_file():
             raise FileNotFoundError(f"No such sound file: {path}")
@@ -130,7 +139,7 @@ if __name__ == "__main__":
         sys.exit(1)
 
     audio = TrackbotAudio()
-    audio.play(sys.argv[1])
+    audio.queue(sys.argv[1])
     for extra in sys.argv[2:]:
         audio.queue(extra)
 

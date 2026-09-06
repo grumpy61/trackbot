@@ -20,14 +20,16 @@ import argparse
 import subprocess
 import sys
 import time
+import tkinter as tk
 from enum import Enum, auto
 
 from bot_commands import BotCommandHandler, STOP_HOLD_SHUTDOWN_S
-from bot_gamepad import BTGamepadController
+from bot_gamepad import BTGamepadController, GamepadState
 from bot_motor import BotMotor
 from plain_camera import PlainCameraViewer
 from track_yellow_ball import YellowBallTracker
 from trackbot_audio import TrackbotAudio
+from trackbot_window import TrackbotWindow
 
 
 class Mode(Enum):
@@ -64,6 +66,10 @@ GAMEPAD_DISCONNECTED_SOUND_PATH = "./sounds/gamepadnotfound.wav"
 
 VIDEO_ON_SOUND_PATH = "./sounds/videoison.wav"
 VIDEO_OFF_SOUND_PATH = "./sounds/videoisoff.wav"
+
+ETHERNET_CONNECTED_SOUND_PATH = "./sounds/ethernetconnected.wav"
+WIFI_CONNECTED_SOUND_PATH = "./sounds/wificonnected.wav"
+NO_NETWORK_SOUND_PATH = "./sounds/nonetworksfound.wav"
 
 SHUTDOWN_SOUND_PATH = "./sounds/shuttingdown.wav"
 
@@ -113,12 +119,17 @@ def get_args():
 RECORD_AUTOSTART_DELAY_S = 1.0
 
 
-def mainloop(tracker, motor, start_mode="manual", debug=False):
-    audio = TrackbotAudio()
+def mainloop(tracker, motor, start_mode="manual", debug=False, audio=None):
+    if audio is None:
+        audio = TrackbotAudio()
+    window = TrackbotWindow()
+    window_closed = False
     controller = BTGamepadController(verbose=debug)
     command_handler = BotCommandHandler()
     sensors = SensorHub()
     base_mode = Mode[start_mode.upper()]  # the mode to fall back to when FOLLOW_BALL is off
+    window.set_mode(base_mode.name)
+    window.set_video_status("Recording" if tracker.video_recorder.recording else "Off")
     last_debug_msg = None
     last_recording_state = tracker.video_recorder.recording
     last_follow_state = command_handler.follow_ball
@@ -127,12 +138,17 @@ def mainloop(tracker, motor, start_mode="manual", debug=False):
     pending_record_autostart = tracker.video_recorder.enabled  # --record-preview was passed
     ball_was_found = False
     last_ball_sound_time = -BALL_SOUND_COOLDOWN_S  # so the very first detection can play
+    last_effective_buttons = {}  # last (real gamepad | virtual window) merged button state we acted on
 
     # Announce the gamepad's connection state as of startup, then again on every
     # change (BTGamepadController.poll() reconnects/disconnects automatically).
+    # queue() (not play()) so this waits behind the network-status announcement
+    # (also queued, in _log_network_status()) instead of cutting it off if it's
+    # still playing.
     gamepad_was_connected = controller.device is not None
     print(f"[mainloop] Gamepad {'connected' if gamepad_was_connected else 'not connected'} at startup")
-    audio.play(GAMEPAD_CONNECTED_SOUND_PATH if gamepad_was_connected else GAMEPAD_DISCONNECTED_SOUND_PATH)
+    audio.queue(GAMEPAD_CONNECTED_SOUND_PATH if gamepad_was_connected else GAMEPAD_DISCONNECTED_SOUND_PATH,
+                pause_after=True)
 
     # PlainCameraViewer.tick() never finds anything -- no AI camera is attached, so
     # FOLLOW_BALL can't do anything but spam "ball not found". Block the toggle from
@@ -147,20 +163,32 @@ def mainloop(tracker, motor, start_mode="manual", debug=False):
 
     try:
         while True:
-            command = controller.poll()
-            if command is not None:
-                command_handler.process_command(command)
+            controller.poll()  # updates controller.state.buttons as a side effect; return value unused below
+
+            # Merge the real gamepad's live buttons with the virtual gamepad's
+            # (window.virtual_buttons, keyed by the same evdev keycodes) so a
+            # window button press drives BotCommandHandler exactly like a real
+            # one would -- only re-running process_command() when the combined
+            # state actually changes, same as it would only run on a genuinely
+            # new physical event.
+            effective_buttons = dict(controller.state.buttons)
+            for keycode, pressed in window.virtual_buttons.items():
+                if pressed:
+                    effective_buttons[keycode] = True
+            if effective_buttons != last_effective_buttons:
+                last_effective_buttons = effective_buttons
+                command_handler.process_command(GamepadState(buttons=effective_buttons))
             command_handler.tick()  # ease throttle toward its target, independent of new events
 
             gamepad_connected = controller.device is not None
             if gamepad_connected != gamepad_was_connected:
                 gamepad_was_connected = gamepad_connected
                 print(f"[mainloop] Gamepad {'connected' if gamepad_connected else 'disconnected'}")
-                audio.play(GAMEPAD_CONNECTED_SOUND_PATH if gamepad_connected else GAMEPAD_DISCONNECTED_SOUND_PATH)
+                audio.queue(GAMEPAD_CONNECTED_SOUND_PATH if gamepad_connected else GAMEPAD_DISCONNECTED_SOUND_PATH)
 
-            # Uses the gamepad's live state, not just new events, since this device
-            # doesn't send repeat events while a button is held down.
-            command_handler.check_shutdown_hold(controller.state.buttons)
+            # Uses live button state, not just new events, since neither the real
+            # device (while held) nor the virtual window sends repeat events.
+            command_handler.check_shutdown_hold(effective_buttons)
             if command_handler.shutdown_requested:
                 print(f"[mainloop] A button held for {STOP_HOLD_SHUTDOWN_S:g}s -> shutting down")
                 break
@@ -176,11 +204,13 @@ def mainloop(tracker, motor, start_mode="manual", debug=False):
                 if command_handler.recording:
                     print("[mainloop] resuming video recording")
                     tracker.video_recorder.resume()
-                    audio.play(VIDEO_ON_SOUND_PATH)
+                    audio.queue(VIDEO_ON_SOUND_PATH)
+                    window.set_video_status("Recording")
                 else:
                     print("[mainloop] pausing video recording")
                     tracker.video_recorder.pause()
-                    audio.play(VIDEO_OFF_SOUND_PATH)
+                    audio.queue(VIDEO_OFF_SOUND_PATH)
+                    window.set_video_status("Off")
 
             if command_handler.follow_ball != last_follow_state:
                 last_follow_state = command_handler.follow_ball
@@ -198,6 +228,19 @@ def mainloop(tracker, motor, start_mode="manual", debug=False):
                 else:
                     print(f"[mainloop] Leaving ball tracking mode -> {mode.name}")
                 last_mode = mode
+                window.set_mode(mode.name)
+
+            if not window_closed:
+                try:
+                    window.tick()
+                except tk.TclError:
+                    # User closed the window -- keep driving, just stop touching it.
+                    print("[mainloop] Trackbot window closed")
+                    window_closed = True
+
+            if window.quit_requested:
+                print("[mainloop] Quit button confirmed -> shutting down")
+                break
 
             sensors.read()  # TODO: react to sensor state (e.g. obstacle stop) once wired up
 
@@ -206,7 +249,7 @@ def mainloop(tracker, motor, start_mode="manual", debug=False):
                 if result is not None:
                     if not ball_was_found and time.monotonic() - last_ball_sound_time >= BALL_SOUND_COOLDOWN_S:
                         last_ball_sound_time = time.monotonic()
-                        audio.play(BALL_SOUND_PATH)
+                        audio.queue(BALL_SOUND_PATH)
                     ball_was_found = True
 
                     throttle, steering = _follow_ball_throttle_steering(result)
@@ -233,18 +276,31 @@ def mainloop(tracker, motor, start_mode="manual", debug=False):
     finally:
         motor.stop()
         print("[mainloop] Shutting down")
+        # play(), not queue(): this is the one place interrupting is correct --
+        # the program is exiting in a fixed 4s window regardless, so if some
+        # other clip were still queued ahead of this, queue() could let the
+        # shutdown announcement get silently skipped by the timeout below
+        # without ever actually playing.
         audio.play(SHUTDOWN_SOUND_PATH)
         audio.wait_for_sound(timeout=4)
         motor.close()
         tracker.stop()
         audio.close()
+        if not window_closed:
+            try:
+                window.close()
+            except tk.TclError:
+                pass
 
 
-def _log_network_status():
+def _log_network_status(audio=None):
     """Best-effort: log which network interfaces (wifi/ethernet) are connected,
     to what, and the device's IP address(es) -- useful from the startup log for
     diagnosing "why can't I SSH/VNC in" without needing a monitor on the bot.
+    If audio is given, also plays a sound reflecting the result: ethernet takes
+    priority over wifi if both are connected, else the no-network sound.
     Never raises -- a missing nmcli or no network at all is just logged, not fatal."""
+    connected_types = set()
     try:
         result = subprocess.run(
             ["nmcli", "-t", "-f", "DEVICE,TYPE,STATE,CONNECTION", "device", "status"],
@@ -259,12 +315,23 @@ def _log_network_status():
             connection = ":".join(parts[3:])  # connection names could contain ':'
             if dev_type in ("wifi", "ethernet") and state == "connected":
                 connected.append(f'{dev_type} {device} -> "{connection}"')
+                connected_types.add(dev_type)
         if connected:
             print(f"[network] Connected: {', '.join(connected)}")
         else:
             print("[network] No wifi/ethernet connection detected.")
     except (OSError, subprocess.SubprocessError) as e:
         print(f"[network] nmcli check failed: {e}", file=sys.stderr)
+
+    if audio is not None:
+        # queue(), not play() -- this runs first in practice, but queue() still
+        # can't ever cut off something already playing/queued, unlike play().
+        if "ethernet" in connected_types:
+            audio.queue(ETHERNET_CONNECTED_SOUND_PATH, pause_after=True)
+        elif "wifi" in connected_types:
+            audio.queue(WIFI_CONNECTED_SOUND_PATH, pause_after=True)
+        else:
+            audio.queue(NO_NETWORK_SOUND_PATH, pause_after=True)
 
     try:
         ip_result = subprocess.run(["hostname", "-I"], capture_output=True, text=True, timeout=5)
@@ -319,10 +386,11 @@ def init(args):
 
 
 def main():
-    _log_network_status()
+    audio = TrackbotAudio()  # shared across the network-status check and mainloop()
+    _log_network_status(audio)
     args = get_args()
     tracker, motor = init(args)
-    mainloop(tracker, motor, start_mode=args.start_mode, debug=args.debug)
+    mainloop(tracker, motor, start_mode=args.start_mode, debug=args.debug, audio=audio)
 
 
 if __name__ == "__main__":
