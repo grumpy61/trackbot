@@ -107,12 +107,12 @@ class TrackbotWindow:
         right_col = tk.Frame(gamepad, bg=GAMEPAD_PLATE_COLOR)
         right_col.grid(row=0, column=1)
 
-        left_trigger = tk.Button(left_col, text="Left Trigger", width=13)
+        left_trigger = tk.Button(left_col, text="Left (Video)", width=13)
         left_trigger.grid(row=0, column=0, pady=(0, 10))
         self._bind_virtual_button(left_trigger, BTN_L_RECORD_TOGGLE)
         self.trigger_buttons["left"] = left_trigger
 
-        right_trigger = tk.Button(right_col, text="Right Trigger", width=13)
+        right_trigger = tk.Button(right_col, text="Right (Follow)", width=13)
         right_trigger.grid(row=0, column=0, pady=(0, 10))
         self._bind_virtual_button(right_trigger, BTN_R_FOLLOW_TOGGLE)
         self.trigger_buttons["right"] = right_trigger

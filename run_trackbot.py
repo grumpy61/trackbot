@@ -17,6 +17,7 @@ Usage:
 """
 
 import argparse
+import random
 import subprocess
 import sys
 import time
@@ -58,8 +59,35 @@ FOLLOW_MAX_THROTTLE = 0.4  # conservative cap until this is tuned on real hardwa
 # of the FULL frame width -- 0.20 here means a zone ~20% of the screen wide.
 FOLLOW_CENTER_DEADBAND = 0.20
 
-BALL_SOUND_PATH = "./sounds/ball.wav"  # played when a new ball is detected
-BALL_SOUND_COOLDOWN_S = 5.0  # don't replay the sound more often than this
+# Played when a new ball is detected -- one is picked at random each time so it
+# doesn't get repetitive.
+BALL_SOUND_PATHS = [
+    "./sounds/ball.wav",
+    "./sounds/ifoundtheball.wav",
+    "./sounds/igotit.wav",
+    "./sounds/therestheball.wav",
+    "./sounds/getball.wav",
+    "./sounds/dogbark3x.wav",
+]
+
+# Played once after a previously-tracked ball goes missing for a while -- one is
+# picked at random, and it only plays once per "loss episode" (see ball_lost_time/
+# lost_ball_sound_played in mainloop()), not repeatedly for as long as it stays lost.
+LOST_BALL_SOUND_PATHS = [
+    "./sounds/balldisappeared.wav",
+    "./sounds/noball.wav",
+    "./sounds/whotooktheball.wav",
+    "./sounds/wherestheball.wav",
+    "./sounds/lostball.wav",
+]
+
+BALL_SOUND_COOLDOWN_MIN_S = 3.0  # don't replay the sound sooner than this after the last one...
+BALL_SOUND_COOLDOWN_MAX_S = 8.0  # ...up to this long, picked at random each time (see _random_ball_sound_cooldown)
+
+
+def _random_ball_sound_cooldown():
+    return random.uniform(BALL_SOUND_COOLDOWN_MIN_S, BALL_SOUND_COOLDOWN_MAX_S)
+
 
 GAMEPAD_CONNECTED_SOUND_PATH = "./sounds/gamepadconnected.wav"
 GAMEPAD_DISCONNECTED_SOUND_PATH = "./sounds/gamepadnotfound.wav"
@@ -67,9 +95,23 @@ GAMEPAD_DISCONNECTED_SOUND_PATH = "./sounds/gamepadnotfound.wav"
 VIDEO_ON_SOUND_PATH = "./sounds/videoison.wav"
 VIDEO_OFF_SOUND_PATH = "./sounds/videoisoff.wav"
 
+FOLLOWING_ON_SOUND_PATH = "./sounds/followingison.wav"
+FOLLOWING_OFF_SOUND_PATH = "./sounds/followingisoff.wav"
+
 ETHERNET_CONNECTED_SOUND_PATH = "./sounds/ethernetconnected.wav"
-WIFI_CONNECTED_SOUND_PATH = "./sounds/wificonnected.wav"
+WIFI_CONNECTED_SOUND_PATH = "./sounds/wificonnected.wav"  # fallback for a wifi network not in NETWORK_NAME_SOUND_PATHS
 NO_NETWORK_SOUND_PATH = "./sounds/nonetworksfound.wav"
+
+# If a connected wifi network's name (case-insensitively) matches one of these,
+# play that clip instead of the generic WIFI_CONNECTED_SOUND_PATH.
+NETWORK_NAME_SOUND_PATHS = {
+    "mercury": "./sounds/mercury.wav",
+    "trackbot": "./sounds/trackbot.wav",
+    "jupiter": "./sounds/jupiter.wav",
+    "mars": "./sounds/mars.wav",
+    "cinco": "./sounds/cinco.wav",
+    "venus": "./sounds/venus.wav",
+}
 
 SHUTDOWN_SOUND_PATH = "./sounds/shuttingdown.wav"
 
@@ -137,7 +179,11 @@ def mainloop(tracker, motor, start_mode="manual", debug=False, audio=None):
     mainloop_start_time = time.monotonic()
     pending_record_autostart = tracker.video_recorder.enabled  # --record-preview was passed
     ball_was_found = False
-    last_ball_sound_time = -BALL_SOUND_COOLDOWN_S  # so the very first detection can play
+    last_ball_sound_time = -BALL_SOUND_COOLDOWN_MAX_S  # so the very first detection can play
+    next_ball_sound_cooldown = _random_ball_sound_cooldown()
+    ball_lost_time = None  # monotonic time the ball was last seen going missing, or None
+    ball_lost_sound_delay = None  # this episode's randomly-picked delay before playing a "lost" sound
+    lost_ball_sound_played = False  # so it only plays once per loss episode, not repeatedly
     last_effective_buttons = {}  # last (real gamepad | virtual window) merged button state we acted on
 
     # Announce the gamepad's connection state as of startup, then again on every
@@ -168,14 +214,21 @@ def mainloop(tracker, motor, start_mode="manual", debug=False, audio=None):
             # Merge the real gamepad's live buttons with the virtual gamepad's
             # (window.virtual_buttons, keyed by the same evdev keycodes) so a
             # window button press drives BotCommandHandler exactly like a real
-            # one would -- only re-running process_command() when the combined
-            # state actually changes, same as it would only run on a genuinely
-            # new physical event.
+            # one would. Re-run process_command() either when the combined state
+            # actually changed (a genuinely new press/release), or when the real
+            # gamepad reported repeat_codes -- its own PRESSED/HELD (autorepeat)
+            # events for this cycle, per gamepad_test.py -- so holding a button
+            # down acts like tapping it repeatedly, driven by the hardware's own
+            # repeat events rather than a synthetic timer (though throttled to a
+            # fixed cadence, not the hardware's actual repeat rate -- see
+            # HELD_REPEAT_INTERVAL_S in bot_gamepad.py). (The virtual window
+            # gamepad has no such repeat signal, so holding it down there doesn't
+            # auto-repeat -- only a real gamepad's own held buttons do.)
             effective_buttons = dict(controller.state.buttons)
             for keycode, pressed in window.virtual_buttons.items():
                 if pressed:
                     effective_buttons[keycode] = True
-            if effective_buttons != last_effective_buttons:
+            if effective_buttons != last_effective_buttons or controller.state.repeat_codes:
                 last_effective_buttons = effective_buttons
                 command_handler.process_command(GamepadState(buttons=effective_buttons))
             command_handler.tick()  # ease throttle toward its target, independent of new events
@@ -186,37 +239,50 @@ def mainloop(tracker, motor, start_mode="manual", debug=False, audio=None):
                 print(f"[mainloop] Gamepad {'connected' if gamepad_connected else 'disconnected'}")
                 audio.queue(GAMEPAD_CONNECTED_SOUND_PATH if gamepad_connected else GAMEPAD_DISCONNECTED_SOUND_PATH)
 
-            # Uses live button state, not just new events, since neither the real
-            # device (while held) nor the virtual window sends repeat events.
+            # Uses live button state (effective_buttons), not just new/repeat events,
+            # since measuring a continuous hold needs to sample "is it down right
+            # now" every iteration -- the real gamepad's own HELD events are
+            # throttled to once per HELD_REPEAT_INTERVAL_S (see bot_gamepad.py), too
+            # coarse to time a hold by themselves, and the virtual window has no
+            # event/repeat concept at all, just a live pressed/not-pressed dict.
             command_handler.check_shutdown_hold(effective_buttons)
             if command_handler.shutdown_requested:
-                print(f"[mainloop] A button held for {STOP_HOLD_SHUTDOWN_S:g}s -> shutting down")
+                print(f"[mainloop] 'A' button held for {STOP_HOLD_SHUTDOWN_S:g}s -> shutting down")
                 break
 
+            # Start video recording if the auto-start delay has passed
             if pending_record_autostart and time.monotonic() - mainloop_start_time >= RECORD_AUTOSTART_DELAY_S:
                 pending_record_autostart = False
                 print(f"[mainloop] --record-preview: starting video recording "
                       f"({RECORD_AUTOSTART_DELAY_S:g}s after mainloop start)")
                 command_handler.begin_recording()
 
+            # Announce changes in video recording state
             if command_handler.recording != last_recording_state:
                 last_recording_state = command_handler.recording
                 if command_handler.recording:
-                    print("[mainloop] resuming video recording")
                     tracker.video_recorder.resume()
+                    print(f"[mainloop] Video recording ON -> {tracker.video_recorder.current_path}")
                     audio.queue(VIDEO_ON_SOUND_PATH)
                     window.set_video_status("Recording")
                 else:
-                    print("[mainloop] pausing video recording")
                     tracker.video_recorder.pause()
+                    print(f"[mainloop] Video recording OFF -> {tracker.video_recorder.current_path}")
                     audio.queue(VIDEO_OFF_SOUND_PATH)
                     window.set_video_status("Off")
 
+            # Announce changes in ball-following state
             if command_handler.follow_ball != last_follow_state:
                 last_follow_state = command_handler.follow_ball
                 if command_handler.follow_ball and not follow_ball_available:
                     print("[mainloop] Right trigger pressed -> FOLLOW_BALL requested, but no AI camera "
                           f"available -- staying in {base_mode.name}")
+                elif command_handler.follow_ball:
+                    print("[mainloop] Ball-following enabled")
+                    audio.queue(FOLLOWING_ON_SOUND_PATH)
+                else:
+                    print("[mainloop] Ball-following disabled")
+                    audio.queue(FOLLOWING_OFF_SOUND_PATH)
 
             mode = Mode.FOLLOW_BALL if (command_handler.follow_ball and follow_ball_available) else base_mode
 
@@ -225,6 +291,11 @@ def mainloop(tracker, motor, start_mode="manual", debug=False, audio=None):
             if mode != last_mode:
                 if mode is Mode.FOLLOW_BALL:
                     print("[mainloop] Entering ball tracking mode")
+                    # Fresh start each time -- don't let a stale "lost the ball"
+                    # timer from a previous follow-mode session carry over.
+                    ball_was_found = False
+                    ball_lost_time = None
+                    lost_ball_sound_played = False
                 else:
                     print(f"[mainloop] Leaving ball tracking mode -> {mode.name}")
                 last_mode = mode
@@ -247,18 +318,40 @@ def mainloop(tracker, motor, start_mode="manual", debug=False, audio=None):
             if mode is Mode.FOLLOW_BALL:
                 result = tracker.tick()
                 if result is not None:
-                    if not ball_was_found and time.monotonic() - last_ball_sound_time >= BALL_SOUND_COOLDOWN_S:
+                    if not ball_was_found and time.monotonic() - last_ball_sound_time >= next_ball_sound_cooldown:
                         last_ball_sound_time = time.monotonic()
-                        audio.queue(BALL_SOUND_PATH)
+                        next_ball_sound_cooldown = _random_ball_sound_cooldown()
+                        audio.queue(random.choice(BALL_SOUND_PATHS))
                     ball_was_found = True
+                    ball_lost_time = None
+                    lost_ball_sound_played = False
 
                     throttle, steering = _follow_ball_throttle_steering(result)
                     debug_print(f"[mainloop] FOLLOW_BALL: motor.drive(throttle={throttle:.3f}, steering={steering:.3f})")
                     motor.drive(throttle=throttle, steering=steering)
                 else:
+                    # No ball currently detected -- fall back to manual gamepad
+                    # control (same as Mode.MANUAL) so the user can reposition or
+                    # look around to reacquire one, instead of the bot just
+                    # sitting stopped and unresponsive until it reappears.
+                    if ball_was_found:
+                        # Just lost it this frame -- start this loss episode's timer.
+                        ball_lost_time = time.monotonic()
+                        ball_lost_sound_delay = _random_ball_sound_cooldown()
+                        lost_ball_sound_played = False
                     ball_was_found = False
-                    debug_print("[mainloop] FOLLOW_BALL: ball not found -> motor.stop()")
-                    motor.stop()
+
+                    if (ball_lost_time is not None and not lost_ball_sound_played
+                            and time.monotonic() - ball_lost_time >= ball_lost_sound_delay):
+                        lost_ball_sound_played = True
+                        audio.queue(random.choice(LOST_BALL_SOUND_PATHS))
+
+                    left, right = command_handler.left, command_handler.right
+                    debug_print(
+                        f"[mainloop] FOLLOW_BALL: ball not found -> manual control "
+                        f"motor.drive_lr(left={left:.3f}, right={right:.3f})"
+                    )
+                    motor.drive_lr(left=left, right=right)
             elif mode is Mode.MANUAL:
                 left, right = command_handler.left, command_handler.right
                 debug_print(
@@ -293,20 +386,25 @@ def mainloop(tracker, motor, start_mode="manual", debug=False, audio=None):
                 pass
 
 
-def _log_network_status(audio=None):
-    """Best-effort: log which network interfaces (wifi/ethernet) are connected,
-    to what, and the device's IP address(es) -- useful from the startup log for
-    diagnosing "why can't I SSH/VNC in" without needing a monitor on the bot.
-    If audio is given, also plays a sound reflecting the result: ethernet takes
-    priority over wifi if both are connected, else the no-network sound.
-    Never raises -- a missing nmcli or no network at all is just logged, not fatal."""
+NETWORK_CHECK_RETRY_INTERVAL_S = 1.0  # how often to re-check while waiting for a connection
+NETWORK_CHECK_TIMEOUT_S = 12.0  # give up and report "no network" after this long
+
+
+def _check_network_once():
+    """Single best-effort nmcli query. Returns (connected_types, connected_desc,
+    wifi_names) -- connected_types is a set of "wifi"/"ethernet" strings,
+    connected_desc a list of human-readable "type device -> connection" strings
+    for logging, wifi_names the connection name(s) of any connected wifi
+    interface(s) (for matching against NETWORK_NAME_SOUND_PATHS). Never raises --
+    a missing nmcli is just reported as no connection, not fatal."""
     connected_types = set()
+    connected = []
+    wifi_names = []
     try:
         result = subprocess.run(
             ["nmcli", "-t", "-f", "DEVICE,TYPE,STATE,CONNECTION", "device", "status"],
             capture_output=True, text=True, timeout=5,
         )
-        connected = []
         for line in result.stdout.strip().splitlines():
             parts = line.split(":")
             if len(parts) < 4:
@@ -316,12 +414,49 @@ def _log_network_status(audio=None):
             if dev_type in ("wifi", "ethernet") and state == "connected":
                 connected.append(f'{dev_type} {device} -> "{connection}"')
                 connected_types.add(dev_type)
-        if connected:
-            print(f"[network] Connected: {', '.join(connected)}")
-        else:
-            print("[network] No wifi/ethernet connection detected.")
+                if dev_type == "wifi":
+                    wifi_names.append(connection)
     except (OSError, subprocess.SubprocessError) as e:
         print(f"[network] nmcli check failed: {e}", file=sys.stderr)
+    return connected_types, connected, wifi_names
+
+
+def _wifi_sound_path(wifi_names):
+    """Return the NETWORK_NAME_SOUND_PATHS entry for the first connected wifi
+    network name that matches (case-insensitively), or WIFI_CONNECTED_SOUND_PATH
+    if none of them do."""
+    for name in wifi_names:
+        sound_path = NETWORK_NAME_SOUND_PATHS.get(name.strip().lower())
+        if sound_path:
+            return sound_path
+    return WIFI_CONNECTED_SOUND_PATH
+
+
+def _log_network_status(audio=None):
+    """Best-effort: log which network interfaces (wifi/ethernet) are connected,
+    to what, and the device's IP address(es) -- useful from the startup log for
+    diagnosing "why can't I SSH/VNC in" without needing a monitor on the bot.
+    If audio is given, also plays a sound reflecting the result: ethernet takes
+    priority over wifi if both are connected, else the no-network sound. A wifi
+    connection whose network name matches NETWORK_NAME_SOUND_PATHS plays that
+    clip instead of the generic wifi-connected one (see _wifi_sound_path).
+
+    This runs right at process start, which on a fresh boot can race NetworkManager
+    still associating with wifi -- so a single immediate check can catch it
+    mid-connect and wrongly report "no network" a moment before it actually
+    connects. To avoid that false negative, retry every
+    NETWORK_CHECK_RETRY_INTERVAL_S until something's connected or
+    NETWORK_CHECK_TIMEOUT_S runs out, and only report/announce the final result."""
+    deadline = time.monotonic() + NETWORK_CHECK_TIMEOUT_S
+    connected_types, connected, wifi_names = _check_network_once()
+    while not connected_types and time.monotonic() < deadline:
+        time.sleep(NETWORK_CHECK_RETRY_INTERVAL_S)
+        connected_types, connected, wifi_names = _check_network_once()
+
+    if connected:
+        print(f"[network] Connected: {', '.join(connected)}")
+    else:
+        print("[network] No wifi/ethernet connection detected.")
 
     if audio is not None:
         # queue(), not play() -- this runs first in practice, but queue() still
@@ -329,7 +464,7 @@ def _log_network_status(audio=None):
         if "ethernet" in connected_types:
             audio.queue(ETHERNET_CONNECTED_SOUND_PATH, pause_after=True)
         elif "wifi" in connected_types:
-            audio.queue(WIFI_CONNECTED_SOUND_PATH, pause_after=True)
+            audio.queue(_wifi_sound_path(wifi_names), pause_after=True)
         else:
             audio.queue(NO_NETWORK_SOUND_PATH, pause_after=True)
 
@@ -364,6 +499,17 @@ def init(args):
             upside_down=args.upside_down,
         )
         tracker.start()
+        # The very first tracker.tick() call after start() reliably blocks for a
+        # few seconds (observed ~3s) waiting on the camera/inference pipeline's
+        # first completed request -- every call after that is ~40ms. tick() is
+        # only ever called from the mainloop's FOLLOW_BALL branch, so without
+        # this warm-up call that multi-second stall (during which the whole
+        # single-threaded mainloop, including the Tkinter window pump and the
+        # camera's own frame delivery, is blocked) would hit the user the first
+        # time they switch into ball-following -- looking exactly like the
+        # program freezing with no video. Absorb it here instead, during
+        # startup, before the window/gamepad loop is ever interactive.
+        tracker.tick()
     except RuntimeError as e:
         if str(e) != IMX500_NOT_FOUND_ERROR:
             raise

@@ -19,6 +19,7 @@ import evdev
 from evdev import categorize, ecodes
 
 RECONNECT_INTERVAL_S = 1.5  # how often to re-scan for a gamepad while disconnected
+HELD_REPEAT_INTERVAL_S = 0.5  # a HELD event counts as a repeat at most this often, per key
 
 
 def _ensure_bluetooth_powered_on():
@@ -55,9 +56,14 @@ def find_gamepads():
 
 @dataclass
 class GamepadState:
-    """Latest known state: buttons is {code: pressed_bool}, axes is {code: value}."""
+    """Latest known state: buttons is {code: pressed_bool}, axes is {code: value}.
+    repeat_codes is transient -- the set of keycodes that had a PRESSED or HELD
+    (evdev value 1 or 2) event in the batch processed by the *most recent*
+    poll() call only, so callers can tell a held button apart from one that's
+    just sitting there unchanged (buttons alone can't distinguish those)."""
     buttons: dict = field(default_factory=dict)
     axes: dict = field(default_factory=dict)
+    repeat_codes: set = field(default_factory=set)
 
 
 class BTGamepadController:
@@ -73,6 +79,7 @@ class BTGamepadController:
         self.state = GamepadState()
         self.verbose = verbose  # print each raw key/axis event to the console as it arrives
         self._last_reconnect_attempt = time.monotonic()
+        self._last_held_time = {}  # keycode -> monotonic time its last accepted HELD event landed
         self._try_connect()
         if self.device is None:
             print(
@@ -87,6 +94,11 @@ class BTGamepadController:
             print(f"[BTGamepadController] Connected to: {self.device.name} ({self.device.path})")
 
     def poll(self):
+        # Cleared on every call (not just when new events arrive) so it always
+        # reflects only *this* call's batch -- otherwise a single HELD event
+        # would look like it's still happening on every later poll() too.
+        self.state.repeat_codes = set()
+
         if self.device is None:
             now = time.monotonic()
             if now - self._last_reconnect_attempt >= RECONNECT_INTERVAL_S:
@@ -102,6 +114,16 @@ class BTGamepadController:
             for event in self.device.read():
                 if event.type == ecodes.EV_KEY:
                     self.state.buttons[event.code] = event.value != 0
+                    if event.value == 1:  # PRESSED -- the real press, always counts right away
+                        self._last_held_time[event.code] = time.monotonic()
+                        self.state.repeat_codes.add(event.code)
+                    elif event.value == 2:  # HELD -- the device's own autorepeat, fires much
+                        # faster than we want to act on it, so only accept one every
+                        # HELD_REPEAT_INTERVAL_S per key (independent of other keys).
+                        now = time.monotonic()
+                        if now - self._last_held_time.get(event.code, 0.0) >= HELD_REPEAT_INTERVAL_S:
+                            self._last_held_time[event.code] = now
+                            self.state.repeat_codes.add(event.code)
                     if self.verbose:
                         keycode = categorize(event).keycode
                         state = "PRESSED" if event.value == 1 else "RELEASED" if event.value == 0 else "HELD"

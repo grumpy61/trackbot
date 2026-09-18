@@ -39,10 +39,19 @@ class VideoRecorder:
         self._want_recording = False  # caller's desired on/off state, via resume()/pause()
         self._recording = False  # whether a segment is actually being encoded right now
         self._segment_start = None
+        self._encoder = None  # the currently-running segment's encoder, if any
+        self._current_path = None  # path of the current (or most recently stopped) segment
 
     @property
     def recording(self):
         return self._recording
+
+    @property
+    def current_path(self):
+        """Path of the segment currently being recorded, or (once stopped) the last
+        one that was -- so a caller logging a "recording off" event can still name
+        the file that was just closed. None before the first segment ever starts."""
+        return self._current_path
 
     def start(self, picam2):
         self._picam2 = picam2
@@ -95,12 +104,25 @@ class VideoRecorder:
         # encoded stream out to a separate `ffmpeg` subprocess over stdin like FfmpegOutput
         # did -- that pipe was consistently getting invalid data ("Error opening input
         # file -." from ffmpeg) on this setup, every time recording started.
-        self._picam2.start_recording(H264Encoder(), PyavOutput(str(path)))
+        #
+        # Deliberately start_encoder()/stop_encoder() here, NOT Picamera2's higher-level
+        # start_recording()/stop_recording() convenience methods -- those call self.stop()
+        # (stopping the whole camera, not just the encoder) and self.start() again, which
+        # briefly halts frame delivery to whatever else is using the camera (the live
+        # preview, and capture_metadata() for ball detection). Observed in practice: after
+        # stop_recording(), the next capture_metadata() call hung forever, freezing the
+        # whole program -- because the camera had actually been stopped and nothing ever
+        # restarted it. start_encoder()/stop_encoder() only touch the encoder, leaving the
+        # camera (and everything else reading from it) running the whole time.
+        self._encoder = H264Encoder()
+        self._picam2.start_encoder(self._encoder, PyavOutput(str(path)), name="main")
         self._recording = True
         self._segment_start = time.monotonic()
+        self._current_path = path
         print(f"[VideoRecorder] Recording to {path}")
 
     def _stop_segment(self):
         if self._recording:
-            self._picam2.stop_recording()
+            self._picam2.stop_encoder(self._encoder)
+            self._encoder = None
             self._recording = False
