@@ -48,8 +48,8 @@ STOP_HOLD_SHUTDOWN_S = 3.0
 # opposite-direction press, DECEL, or STOP moves it back down -- otherwise a
 # release between taps (which is how repeated presses necessarily arrive)
 # would keep undoing progress, and it'd take holding the key down (for the
-# device's own key-repeat events) to ever get anywhere. Steering is NOT a
-# ratchet -- see the comment above STEERING_DIFF below.
+# device's own key-repeat events) to ever get anywhere. Steering is not
+# a ratchet -- see the comment above STEERING_TABLE below.
 
 # Throttle ramp, tuned against the physical bot: the bot doesn't actually move
 # until the 3rd fwd press (lower values don't clear the motor's deadband). So:
@@ -71,26 +71,37 @@ THROTTLE_SMOOTH_STEP = 0.5
 
 THROTTLE_TOTAL_PRESSES = THROTTLE_DEAD_PRESSES + 1 + THROTTLE_RAMP_PRESSES  # zero to full throttle
 
-# Steering is deliberately NOT a ratchet like throttle: it's a simple, direct
-# level -- self.steering is just -1.0/0.0/1.0 depending on which of LEFT/RIGHT
-# (if either) is currently held, recomputed from scratch on every
-# process_command() call. No press-counting, no ramp-up, no dependency on the
-# gamepad's HELD/autorepeat cadence: full steering effect is applied the
-# instant the button goes down, and it's gone the instant the button comes up.
-# (An earlier ramped version required holding the button for several seconds
-# to build up any noticeable turn, and snapped back to 0 on release -- so a
-# normal tap barely turned the bot at all before undoing itself.)
+# Steering is a direct level, not a ratchet: self.steering is -1.0 (left) or 1.0
+# (right), set the instant LEFT/RIGHT is pressed -- no press-counting, no ramp-up.
+# It holds that direction after release, until the other direction is pressed or
+# X/STRAIGHT or STOP recenters it.
 
-# Speed gap between the outside and inside tracks while steering is held, in
-# drive-power units. Split around the straight-line speed (outside is raised by
-# half of it, inside sits the full gap below the outside), so the average speed
-# is kept rather than just slowing one track.
-STEERING_DIFF = 0.5
+# While moving, steering keeps both tracks driving: the outside track is raised
+# by half of a speed gap ("diff") and the inside track sits the full gap below
+# it, but never below a minimum ("min inside", a forward speed that still clears
+# the motor deadband) so a turn never stalls the bot or spins it in place -- only
+# a turn from a dead stop pivots. Both values depend on the throttle level, and
+# are interpolated from this table by _steering_params(): each row is
+# (throttle magnitude, diff, min_inside). Below the first / above the last row
+# the nearest row's values are used. Tune slow/medium/fast turning here.
+STEERING_TABLE = (
+    (0.35, 0.75, 0.25),  # slow    -- just above the deadband floor
+    (0.65, 0.85, 0.20),  # medium
+    (1.00, 0.85, 0.25),  # fast    -- outside track is capped at 1.0, so the inside can't drop as far
+)
 
-# While moving, the inside track is never slowed below this (a forward speed
-# that still clears the motor deadband), so a turn never stalls the bot or
-# spins it in place -- only a turn from a dead stop pivots.
-STEERING_MIN_INSIDE = THROTTLE_FLOOR
+
+def _steering_params(throttle):
+    """Return (diff, min_inside) for this throttle level, linearly interpolated
+    between the STEERING_TABLE rows."""
+    t = abs(throttle)
+    if t <= STEERING_TABLE[0][0]:
+        return STEERING_TABLE[0][1], STEERING_TABLE[0][2]
+    for (t0, d0, m0), (t1, d1, m1) in zip(STEERING_TABLE, STEERING_TABLE[1:]):
+        if t <= t1:
+            f = (t - t0) / (t1 - t0)
+            return d0 + f * (d1 - d0), m0 + f * (m1 - m0)
+    return STEERING_TABLE[-1][1], STEERING_TABLE[-1][2]
 
 # Drive power applied to the tracks is self.throttle times this (clamped to
 # +/-1.0), so the bot keeps moving forward through turns instead of bogging down
@@ -99,9 +110,10 @@ STEERING_MIN_INSIDE = THROTTLE_FLOOR
 SPEED_GAIN = 1.3
 
 # Fixed pivot power applied to the outside track when steering is held at a
-# dead stop (throttle == 0), where there is no forward speed to keep. Set to the same floor used to first clear the drive motor's deadband
-# (see THROTTLE_FLOOR above), so a pivot reliably starts moving right away.
-STEERING_PIVOT_SPEED = THROTTLE_FLOOR
+# dead stop (throttle == 0), where there is no forward speed to keep. Set to the
+# same floor used to first clear the drive motor's deadband (see THROTTLE_FLOOR
+# above), so a pivot reliably starts moving right away.
+STEERING_PIVOT_SPEED = THROTTLE_FLOOR * 1.5
 
 
 class _QuickClickToggle:
@@ -148,7 +160,7 @@ class BotCommandHandler:
 
     def __init__(self):
         self.throttle = 0.0
-        self.steering = 0.0  # direct level: -1.0 (left), 0.0, or 1.0 (right)
+        self.steering = 0.0  # -1.0 (left), 0.0 (straight), or 1.0 (right); holds after release
         self._throttle_target = 0.0
         self._throttle_press_count = 0
         self._throttle_press_dir = 0
@@ -193,19 +205,13 @@ class BotCommandHandler:
         self._follow_toggle.update(buttons.get(BTN_R_FOLLOW_TOGGLE, False))
 
         if buttons.get(BTN_A_STOP, False):
-            # Immediate stop/zero, bypassing the eased ramp and the smoothing below.
+            # Immediate stop/zero, bypassing the eased ramp and the smoothing.
             # Also drops back out of FOLLOW_BALL -- an emergency stop should hand
             # control back to the human, not leave the bot driving itself.
-            self.throttle = 0.0
-            self._throttle_target = 0.0
-            self.steering = 0.0
-            self._throttle_press_count = 0
-            self._throttle_press_dir = 0
-            self._follow_toggle.force_off()
+            self.stop_all()
             return
 
         if buttons.get(BTN_X_STRAIGHT, False):
-            # self._drop_throttle_step()
             self.steering = 0.0
             return
 
@@ -217,15 +223,30 @@ class BotCommandHandler:
         throttle_target = float(up) - float(down)
         self._update_throttle_target(throttle_target)
 
-        # Direct level, not a ratchet: recomputed fresh from the current button
-        # state every call, so it's fully in effect the instant a direction is
-        # held and back to 0 the instant it's released (or both/neither held).
+        # Steering holds its last direction when the button is released (only
+        # X/STRAIGHT or STOP recenters it); zeroing it on release made taps of
+        # LEFT/RIGHT cancel themselves out before the bot could turn.
         if right and not left:
             self.steering = 1.0
         elif left and not right:
             self.steering = -1.0
-        else:
-            self.steering = 0.0
+
+    def stop_all(self):
+        """Immediately zero throttle and steering (no easing), and leave
+        FOLLOW_BALL. Used by the STOP button and when the gamepad drops out."""
+        self.throttle = 0.0
+        self._throttle_target = 0.0
+        self.steering = 0.0
+        self._throttle_press_count = 0
+        self._throttle_press_dir = 0
+        self._follow_toggle.force_off()
+
+    def drive_state(self):
+        """Snapshot of the manual-drive values, for change logging: (throttle_target,
+        throttle, presses, steering, left, right)."""
+        left, right = self._motor_lr()
+        return (round(self._throttle_target, 3), round(self.throttle, 3),
+                self._throttle_press_count, self.steering, round(left, 3), round(right, 3))
 
     @property
     def left(self):
@@ -237,12 +258,12 @@ class BotCommandHandler:
 
     def _motor_lr(self):
         """Differential-drive mix for BotMotor.drive_lr(). While moving, steering
-        keeps BOTH tracks driving: the outside track is raised by half of
-        STEERING_DIFF and the inside track sits STEERING_DIFF below it, so the
-        average speed is kept. Clamped at full power (the outside caps at 1.0 and
-        the inside stays STEERING_DIFF below that), and the inside track never
-        drops below STEERING_MIN_INSIDE, so forward motion continues through the
-        turn instead of stalling or spinning.
+        keeps BOTH tracks driving: the outside track is raised by half of the
+        throttle-dependent diff and the inside track sits the full diff below it,
+        so the average speed is kept. Clamped at full power (the outside caps at
+        1.0), and the inside track never drops below the throttle-dependent min
+        inside, so forward motion continues through the turn instead of stalling
+        or spinning. diff and min inside come from _steering_params().
 
         At a dead stop (throttle == 0) there is no forward motion to preserve, so
         steering pivots the bot at a fixed STEERING_PIVOT_SPEED instead."""
@@ -251,15 +272,18 @@ class BotCommandHandler:
         if self.steering == 0.0:
             return drive, drive
 
-        if self.throttle == 0.0:
+        if self.throttle == 0.0:        # Pivot in place
+            reverse_pivot = -0.5 * STEERING_PIVOT_SPEED
             if self.steering > 0:
-                return STEERING_PIVOT_SPEED, 0.0  # steering right -> left track pivots, right stays still
-            return 0.0, STEERING_PIVOT_SPEED  # steering left -> right track pivots, left stays still
+                return STEERING_PIVOT_SPEED, reverse_pivot  # steering right -> left track pivots, right stays still
+            return reverse_pivot, STEERING_PIVOT_SPEED  # steering left -> right track pivots, left stays still
 
+        # Differential-drive mix for normal driving with steering
         sign = 1.0 if drive > 0 else -1.0
         mag = abs(drive)
-        outside = min(1.0, mag + STEERING_DIFF / 2)
-        inside = max(min(STEERING_MIN_INSIDE, outside), outside - STEERING_DIFF)
+        diff, min_inside = _steering_params(self.throttle)
+        outside = min(1.0, mag + diff / 2)
+        inside = max(min(min_inside, outside), outside - diff)
         outside, inside = sign * outside, sign * inside
         if self.steering > 0:
             return outside, inside  # steering right -> right track is inside

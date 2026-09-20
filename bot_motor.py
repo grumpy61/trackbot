@@ -78,6 +78,11 @@ class BotMotor:
     def __init__(self, left_reverse=False, right_reverse=False):
         self.left = Motor(LEFT_FWD_CHANNEL, LEFT_REV_CHANNEL, reverse=left_reverse)
         self.right = Motor(RIGHT_FWD_CHANNEL, RIGHT_REV_CHANNEL, reverse=right_reverse)
+        # Last (left, right) speeds actually written to the PWM hardware, so the
+        # mainloop can call drive()/drive_lr()/stop() every iteration without
+        # rewriting the hardware unless the values really changed. None = unknown
+        # (e.g. after brake()), which forces the next command through.
+        self._last_lr = (0.0, 0.0)
 
     def drive(self, throttle=0.0, steering=0.0):
         """throttle: -1.0 (full reverse) .. 1.0 (full forward)
@@ -85,23 +90,31 @@ class BotMotor:
         """
         throttle = _clamp(throttle)
         steering = _clamp(steering)
-        self.left.set_speed(_clamp(throttle + steering))
-        self.right.set_speed(_clamp(throttle - steering))
+        self.drive_lr(_clamp(throttle + steering), _clamp(throttle - steering))
 
     def drive_lr(self, left=0.0, right=0.0):
         """Set left/right track speeds directly (already-mixed, e.g. by
         BotCommandHandler.left/right's asymmetric steering), bypassing the
-        throttle +/- steering mix that drive() uses."""
-        self.left.set_speed(_clamp(left))
-        self.right.set_speed(_clamp(right))
+        throttle +/- steering mix that drive() uses. Only touches the hardware
+        if the (clamped) speeds differ from what was last written."""
+        lr = (_clamp(left), _clamp(right))
+        if lr == self._last_lr:
+            return
+        self.left.set_speed(lr[0])
+        self.right.set_speed(lr[1])
+        self._last_lr = lr
 
     def stop(self):
+        if self._last_lr == (0.0, 0.0):
+            return
         self.left.stop()
         self.right.stop()
+        self._last_lr = (0.0, 0.0)
 
     def brake(self):
         self.left.brake()
         self.right.brake()
+        self._last_lr = None
 
     def close(self):
         self.left.close()

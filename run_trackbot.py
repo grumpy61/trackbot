@@ -24,7 +24,7 @@ import time
 import tkinter as tk
 from enum import Enum, auto
 
-from bot_commands import BotCommandHandler, STOP_HOLD_SHUTDOWN_S
+from bot_commands import BotCommandHandler, STOP_HOLD_SHUTDOWN_S, BTN_LEFT, BTN_RIGHT
 from bot_gamepad import BTGamepadController, GamepadState
 from bot_motor import BotMotor
 from plain_camera import PlainCameraViewer
@@ -184,6 +184,8 @@ def mainloop(tracker, motor, start_mode="manual", debug=False, audio=None):
     ball_lost_time = None  # monotonic time the ball was last seen going missing, or None
     ball_lost_sound_delay = None  # this episode's randomly-picked delay before playing a "lost" sound
     lost_ball_sound_played = False  # so it only plays once per loss episode, not repeatedly
+    gamepad_in_use = False  # real gamepad has sent input since it connected (arms the dropout fail-safe)
+    last_drive_state = None  # last logged (throttle/steering/left/right) snapshot, to log only changes
     last_effective_buttons = {}  # last (real gamepad | virtual window) merged button state we acted on
 
     # Announce the gamepad's connection state as of startup, then again on every
@@ -224,19 +226,42 @@ def mainloop(tracker, motor, start_mode="manual", debug=False, audio=None):
             # HELD_REPEAT_INTERVAL_S in bot_gamepad.py). (The virtual window
             # gamepad has no such repeat signal, so holding it down there doesn't
             # auto-repeat -- only a real gamepad's own held buttons do.)
+            if any(controller.state.buttons.values()) or controller.state.repeat_codes:
+                gamepad_in_use = True  # the real gamepad has been giving input
             effective_buttons = dict(controller.state.buttons)
             for keycode, pressed in window.virtual_buttons.items():
                 if pressed:
                     effective_buttons[keycode] = True
+            for name, keycode in (("LEFT", BTN_LEFT), ("RIGHT", BTN_RIGHT)):
+                now_down = effective_buttons.get(keycode, False)
+                if now_down != last_effective_buttons.get(keycode, False):
+                    print(f"[button] {name} {'PRESSED' if now_down else 'RELEASED'}")
             if effective_buttons != last_effective_buttons or controller.state.repeat_codes:
                 last_effective_buttons = effective_buttons
                 command_handler.process_command(GamepadState(buttons=effective_buttons))
             command_handler.tick()  # ease throttle toward its target, independent of new events
 
+            drive_state = command_handler.drive_state()
+            if drive_state != last_drive_state:
+                last_drive_state = drive_state
+                target, throttle_now, presses, steer, left_now, right_now = drive_state
+                print(f"[drive] throttle={throttle_now:.3f} (target={target:.3f}, presses={presses}) "
+                      f"steering={steer:+.0f} -> left={left_now:.3f} right={right_now:.3f}")
+
             gamepad_connected = controller.device is not None
             if gamepad_connected != gamepad_was_connected:
                 gamepad_was_connected = gamepad_connected
                 print(f"[mainloop] Gamepad {'connected' if gamepad_connected else 'disconnected'}")
+                if not gamepad_connected:
+                    # Fail-safe only if the gamepad was actually the thing driving:
+                    # then leave FOLLOW_BALL and stop the bot rather than keep going
+                    # on its last command. If it was never used (e.g. the bot is
+                    # being driven from the window's virtual buttons), leave things be.
+                    if gamepad_in_use:
+                        print("[mainloop] Gamepad lost while in use -> leaving follow mode, "
+                              "throttle and steering zeroed")
+                        command_handler.stop_all()
+                    gamepad_in_use = False
                 audio.queue(GAMEPAD_CONNECTED_SOUND_PATH if gamepad_connected else GAMEPAD_DISCONNECTED_SOUND_PATH)
 
             # Uses live button state (effective_buttons), not just new/repeat events,
@@ -532,6 +557,11 @@ def init(args):
 
 
 def main():
+    # stdout is a pipe (not a terminal) when launched via start_trackbot.sh, which
+    # tees it to a log file -- Python then block-buffers it and log lines don't show
+    # up until exit. Flush on every newline instead.
+    sys.stdout.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True)
     audio = TrackbotAudio()  # shared across the network-status check and mainloop()
     _log_network_status(audio)
     args = get_args()

@@ -137,6 +137,9 @@ class BTGamepadController:
         except OSError as e:
             print(f"[BTGamepadController] Lost connection to gamepad: {e}")
             self.device = None
+            # Forget held buttons -- the release events will never arrive, so a
+            # stale "pressed" would keep acting (e.g. STOP counting toward shutdown).
+            self.state.buttons.clear()
             return None
 
         return self.state

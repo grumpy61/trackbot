@@ -27,7 +27,7 @@ sleep 1
 
 echo
 echo "Starting run_trackbot.py"
-python3 run_trackbot.py --show-preview --record-preview
+python3 -u run_trackbot.py --show-preview --record-preview
 echo "run_trackbot.py exited (status $?)"
 
 # Only replace ourselves with a fresh shell (to keep the window open) when we

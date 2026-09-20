@@ -155,6 +155,11 @@ class YellowBallTracker:
         self.tracked_center = None  # smoothed (x, y) in pixel coords
         self.last_detections = []
         self.last_box = None  # (x, y, w, h) of the last accepted detection, for draw_overlay
+        # Smallest/largest target size seen so far (same units as TrackResult.size_frac:
+        # box area / frame area), kept for later distance estimation. None until the
+        # first detection; reset with reset_size_range().
+        self.min_size_frac = None
+        self.max_size_frac = None
 
     def debug_print(self, msg):
         if self.debug:
@@ -211,7 +216,16 @@ class YellowBallTracker:
         dx = (self.tracked_center[0] - self.frame_w / 2) / (self.frame_w / 2)
         dy = (self.tracked_center[1] - self.frame_h / 2) / (self.frame_h / 2)
         size_frac = (w * h) / (self.frame_w * self.frame_h)
+        if self.min_size_frac is None or size_frac < self.min_size_frac:
+            self.min_size_frac = size_frac
+        if self.max_size_frac is None or size_frac > self.max_size_frac:
+            self.max_size_frac = size_frac
         return TrackResult(dx=dx, dy=dy, size_frac=size_frac, conf=best.conf)
+
+    def reset_size_range(self):
+        """Forget the recorded min/max target size (min_size_frac/max_size_frac)."""
+        self.min_size_frac = None
+        self.max_size_frac = None
 
     def _parse_detections(self, metadata: dict):
         """Parse the output tensor into detections, scaled to the ISP output."""
