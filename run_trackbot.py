@@ -47,8 +47,16 @@ class SensorHub:
         return None  # TODO: read and return sensor state
 
 
-FOLLOW_TARGET_SIZE_FRAC = 0.05  # ball size (box area / frame area) we're aiming to hold at
+FOLLOW_TARGET_SIZE_FRAC = 0.05  # fallback target size, used until FOLLOW_SIZE_HISTORY_MIN_SAMPLES is reached
 FOLLOW_MAX_THROTTLE = 0.4  # conservative cap until this is tuned on real hardware
+
+# Once the tracker has seen at least this many accepted detections, drive toward
+# its running average size (tracker.avg_size_frac) instead of the fixed
+# FOLLOW_TARGET_SIZE_FRAC guess -- "the ball looks small/far compared to what
+# it's typically looked like" rather than a hardcoded distance. Below this many
+# samples there isn't enough of a size history to judge "far" against yet, so
+# _follow_ball_throttle_steering() falls back to the fixed target.
+FOLLOW_SIZE_HISTORY_MIN_SAMPLES = 10
 
 # Ball within this much of center (normalized dx, 0..1) is treated as "centered"
 # -- no steering correction at all, rather than constantly micro-steering at the
@@ -123,13 +131,24 @@ def _follow_ball_steering(dx):
     return sign * (abs(dx) - FOLLOW_CENTER_DEADBAND) / (1.0 - FOLLOW_CENTER_DEADBAND)
 
 
-def _follow_ball_throttle_steering(result):
+def _follow_ball_throttle_steering(result, tracker):
     """First-pass proportional control law: steer toward the ball's dx (once outside
     the FOLLOW_CENTER_DEADBAND), move forward proportional to how much smaller than
-    FOLLOW_TARGET_SIZE_FRAC the box is, and stop (no reverse) once it's at/above
-    target size. Needs tuning on real hardware."""
+    the target size the box is, and stop (no reverse) once it's at/above target
+    size. Needs tuning on real hardware.
+
+    The target size is tracker.avg_size_frac (the average of every accepted
+    detection so far -- see YellowBallTracker.tick()) once there have been at
+    least FOLLOW_SIZE_HISTORY_MIN_SAMPLES of them, so "the ball looks far away"
+    means small relative to how it's actually usually looked, not a fixed
+    guess -- before that many samples exist there isn't enough of a size
+    history to judge against, so it falls back to FOLLOW_TARGET_SIZE_FRAC."""
     steering = _follow_ball_steering(result.dx)
-    gap = (FOLLOW_TARGET_SIZE_FRAC - result.size_frac) / FOLLOW_TARGET_SIZE_FRAC
+    if tracker.size_sample_count >= FOLLOW_SIZE_HISTORY_MIN_SAMPLES:
+        target_size = tracker.avg_size_frac
+    else:
+        target_size = FOLLOW_TARGET_SIZE_FRAC
+    gap = (target_size - result.size_frac) / target_size
     throttle = max(0.0, min(1.0, gap)) * FOLLOW_MAX_THROTTLE
     return throttle, steering
 
@@ -369,7 +388,7 @@ def mainloop(tracker, motor, start_mode="manual", debug=False, audio=None, netwo
                     ball_lost_time = None
                     lost_ball_sound_played = False
 
-                    throttle, steering = _follow_ball_throttle_steering(result)
+                    throttle, steering = _follow_ball_throttle_steering(result, tracker)
                     debug_print(f"[mainloop] FOLLOW_BALL: motor.drive(throttle={throttle:.3f}, steering={steering:.3f})")
                     motor.drive(throttle=throttle, steering=steering)
                 else:

@@ -155,11 +155,17 @@ class YellowBallTracker:
         self.tracked_center = None  # smoothed (x, y) in pixel coords
         self.last_detections = []
         self.last_box = None  # (x, y, w, h) of the last accepted detection, for draw_overlay
-        # Smallest/largest target size seen so far (same units as TrackResult.size_frac:
-        # box area / frame area), kept for later distance estimation. None until the
-        # first detection; reset with reset_size_range().
+        # Smallest/largest/average target size seen so far (same units as
+        # TrackResult.size_frac: box area / frame area), kept for distance
+        # estimation -- e.g. FOLLOW_BALL uses avg_size_frac as a "typical"
+        # distance to drive toward once size_sample_count is high enough (see
+        # run_trackbot.py's _follow_ball_throttle_steering()). min/max_size_frac
+        # are None and avg_size_frac/size_sample_count are 0 until the first
+        # detection; reset with reset_size_range().
         self.min_size_frac = None
         self.max_size_frac = None
+        self.avg_size_frac = 0.0
+        self.size_sample_count = 0
 
     def debug_print(self, msg):
         if self.debug:
@@ -220,12 +226,18 @@ class YellowBallTracker:
             self.min_size_frac = size_frac
         if self.max_size_frac is None or size_frac > self.max_size_frac:
             self.max_size_frac = size_frac
+        # Incremental mean -- avoids keeping every sample just to average them.
+        self.size_sample_count += 1
+        self.avg_size_frac += (size_frac - self.avg_size_frac) / self.size_sample_count
         return TrackResult(dx=dx, dy=dy, size_frac=size_frac, conf=best.conf)
 
     def reset_size_range(self):
-        """Forget the recorded min/max target size (min_size_frac/max_size_frac)."""
+        """Forget the recorded min/max/average target size (min_size_frac/
+        max_size_frac/avg_size_frac/size_sample_count)."""
         self.min_size_frac = None
         self.max_size_frac = None
+        self.avg_size_frac = 0.0
+        self.size_sample_count = 0
 
     def _parse_detections(self, metadata: dict):
         """Parse the output tensor into detections, scaled to the ISP output."""
