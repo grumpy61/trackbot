@@ -12,14 +12,26 @@ poll() periodically re-scans and connects automatically once one shows up.
 import select
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 
 import evdev
 from evdev import categorize, ecodes
 
-RECONNECT_INTERVAL_S = 1.5  # how often to re-scan for a gamepad while disconnected
+RECONNECT_INTERVAL_S = 1.5  # how often poll() re-scans for an already-connected gamepad's device node
 HELD_REPEAT_INTERVAL_S = 0.5  # a HELD event counts as a repeat at most this often, per key
+
+# Most BT gamepads don't reconnect themselves after dropping out of range --
+# BlueZ just leaves a paired device disconnected until something explicitly
+# asks it to reconnect. So besides re-scanning for an already-connected
+# device's evdev node (cheap, fast, done in poll()), a background thread
+# periodically runs `bluetoothctl connect <mac>` against paired devices that
+# look like a gamepad, to actively re-establish the link. A connect attempt
+# against an out-of-range device takes ~5s (observed) to fail, so this must
+# never run on poll()'s thread -- see _ReconnectWorker.
+BT_RECONNECT_INTERVAL_S = 8.0  # how often the background thread retries a connect
+BT_CONNECT_TIMEOUT_S = 10.0  # per-attempt subprocess timeout, generous vs. the ~5s observed
 
 
 def _ensure_bluetooth_powered_on():
@@ -43,15 +55,66 @@ def _ensure_bluetooth_powered_on():
         print(f"[BTGamepadController] bluetoothctl power-on check failed: {e}", file=sys.stderr)
 
 
+def _looks_like_gamepad(name):
+    lower_name = name.lower()
+    return any(kw in lower_name for kw in ("gamepad", "controller", "joystick"))
+
+
 def find_gamepads():
     """Scan system input devices for gamepad/joystick-like devices."""
     devices = [evdev.InputDevice(path) for path in evdev.list_devices()]
-    gamepads = []
-    for device in devices:
-        lower_name = device.name.lower()
-        if any(kw in lower_name for kw in ("gamepad", "cinco", "controller", "joystick")):
-            gamepads.append(device)
-    return gamepads
+    return [device for device in devices if _looks_like_gamepad(device.name)]
+
+
+def _paired_gamepad_macs():
+    """Best-effort: MAC addresses of paired/trusted devices whose name looks like a
+    gamepad (same filter as find_gamepads()), via `bluetoothctl devices Paired`.
+    These are candidates for an active reconnect -- see _ReconnectWorker. Never
+    raises; a missing/failing bluetoothctl just yields no candidates."""
+    try:
+        result = subprocess.run(
+            ["bluetoothctl", "devices", "Paired"], capture_output=True, text=True, timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError) as e:
+        print(f"[BTGamepadController] bluetoothctl devices Paired failed: {e}", file=sys.stderr)
+        return []
+    macs = []
+    for line in result.stdout.strip().splitlines():
+        parts = line.split(maxsplit=2)  # "Device <mac> <name>"
+        if len(parts) == 3 and parts[0] == "Device" and _looks_like_gamepad(parts[2]):
+            macs.append(parts[1])
+    return macs
+
+
+class _ReconnectWorker:
+    """Background thread that periodically runs `bluetoothctl connect <mac>` against
+    paired gamepad-like devices while none is connected, so a gamepad that dropped
+    out of range reconnects on its own once back in range -- without the ~5-10s a
+    connect attempt can take ever blocking poll()'s thread."""
+
+    def __init__(self, is_connected):
+        self._is_connected = is_connected  # callable: True if a gamepad is currently connected
+        self._stop_event = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self):
+        while not self._stop_event.wait(BT_RECONNECT_INTERVAL_S):
+            if self._is_connected():
+                continue
+            for mac in _paired_gamepad_macs():
+                if self._is_connected() or self._stop_event.is_set():
+                    break
+                try:
+                    subprocess.run(
+                        ["bluetoothctl", "connect", mac],
+                        capture_output=True, text=True, timeout=BT_CONNECT_TIMEOUT_S,
+                    )
+                except (OSError, subprocess.SubprocessError) as e:
+                    print(f"[BTGamepadController] bluetoothctl connect {mac} failed: {e}", file=sys.stderr)
+
+    def stop(self):
+        self._stop_event.set()
 
 
 @dataclass
@@ -84,8 +147,10 @@ class BTGamepadController:
         if self.device is None:
             print(
                 "[BTGamepadController] No gamepad found -- input disabled. "
-                f"Will keep checking every {RECONNECT_INTERVAL_S:g}s."
+                f"Will keep checking every {RECONNECT_INTERVAL_S:g}s, and periodically try "
+                f"reconnecting any paired gamepad every {BT_RECONNECT_INTERVAL_S:g}s."
             )
+        self._reconnect_worker = _ReconnectWorker(is_connected=lambda: self.device is not None)
 
     def _try_connect(self):
         gamepads = find_gamepads()
@@ -143,6 +208,9 @@ class BTGamepadController:
             return None
 
         return self.state
+
+    def close(self):
+        self._reconnect_worker.stop()
 
 
 if __name__ == "__main__":

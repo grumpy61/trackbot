@@ -24,7 +24,7 @@ import time
 import tkinter as tk
 from enum import Enum, auto
 
-from bot_commands import BotCommandHandler, STOP_HOLD_SHUTDOWN_S, BTN_LEFT, BTN_RIGHT
+from bot_commands import BotCommandHandler, STOP_HOLD_SHUTDOWN_S
 from bot_gamepad import BTGamepadController, GamepadState
 from bot_motor import BotMotor
 from plain_camera import PlainCameraViewer
@@ -161,7 +161,7 @@ def get_args():
 RECORD_AUTOSTART_DELAY_S = 1.0
 
 
-def mainloop(tracker, motor, start_mode="manual", debug=False, audio=None):
+def mainloop(tracker, motor, start_mode="manual", debug=False, audio=None, network_state=None):
     if audio is None:
         audio = TrackbotAudio()
     window = TrackbotWindow()
@@ -184,9 +184,15 @@ def mainloop(tracker, motor, start_mode="manual", debug=False, audio=None):
     ball_lost_time = None  # monotonic time the ball was last seen going missing, or None
     ball_lost_sound_delay = None  # this episode's randomly-picked delay before playing a "lost" sound
     lost_ball_sound_played = False  # so it only plays once per loss episode, not repeatedly
-    gamepad_in_use = False  # real gamepad has sent input since it connected (arms the dropout fail-safe)
     last_drive_state = None  # last logged (throttle/steering/left/right) snapshot, to log only changes
     last_effective_buttons = {}  # last (real gamepad | virtual window) merged button state we acted on
+    gamepad_in_use = False  # real gamepad has sent input since it (re)connected -- arms the dropout fail-safe
+
+    # Seeded from _log_network_status()'s own startup result (if given) so the
+    # first periodic re-check below doesn't immediately re-announce the same
+    # thing again; (set(), []) if it wasn't given one (e.g. a test harness).
+    last_network_types, last_network_wifi_names = network_state or (set(), [])
+    last_network_check_time = time.monotonic()
 
     # Announce the gamepad's connection state as of startup, then again on every
     # change (BTGamepadController.poll() reconnects/disconnects automatically).
@@ -227,15 +233,11 @@ def mainloop(tracker, motor, start_mode="manual", debug=False, audio=None):
             # gamepad has no such repeat signal, so holding it down there doesn't
             # auto-repeat -- only a real gamepad's own held buttons do.)
             if any(controller.state.buttons.values()) or controller.state.repeat_codes:
-                gamepad_in_use = True  # the real gamepad has been giving input
+                gamepad_in_use = True  # the real gamepad (not just the window) has actually given input
             effective_buttons = dict(controller.state.buttons)
             for keycode, pressed in window.virtual_buttons.items():
                 if pressed:
                     effective_buttons[keycode] = True
-            for name, keycode in (("LEFT", BTN_LEFT), ("RIGHT", BTN_RIGHT)):
-                now_down = effective_buttons.get(keycode, False)
-                if now_down != last_effective_buttons.get(keycode, False):
-                    print(f"[button] {name} {'PRESSED' if now_down else 'RELEASED'}")
             if effective_buttons != last_effective_buttons or controller.state.repeat_codes:
                 last_effective_buttons = effective_buttons
                 command_handler.process_command(GamepadState(buttons=effective_buttons))
@@ -252,17 +254,22 @@ def mainloop(tracker, motor, start_mode="manual", debug=False, audio=None):
             if gamepad_connected != gamepad_was_connected:
                 gamepad_was_connected = gamepad_connected
                 print(f"[mainloop] Gamepad {'connected' if gamepad_connected else 'disconnected'}")
+                audio.queue(GAMEPAD_CONNECTED_SOUND_PATH if gamepad_connected else GAMEPAD_DISCONNECTED_SOUND_PATH)
                 if not gamepad_connected:
                     # Fail-safe only if the gamepad was actually the thing driving:
                     # then leave FOLLOW_BALL and stop the bot rather than keep going
-                    # on its last command. If it was never used (e.g. the bot is
-                    # being driven from the window's virtual buttons), leave things be.
+                    # on its last command -- e.g. it went out of range mid-drive. If
+                    # it was never used (e.g. the bot is being driven from the
+                    # window's virtual buttons), leave things be. BTGamepadController
+                    # keeps trying to reconnect on its own in the background (fast
+                    # device-node rescan plus an active bluetoothctl connect retry --
+                    # see RECONNECT_INTERVAL_S/BT_RECONNECT_INTERVAL_S in
+                    # bot_gamepad.py), so driving resumes as soon as it's back.
                     if gamepad_in_use:
                         print("[mainloop] Gamepad lost while in use -> leaving follow mode, "
                               "throttle and steering zeroed")
                         command_handler.stop_all()
                     gamepad_in_use = False
-                audio.queue(GAMEPAD_CONNECTED_SOUND_PATH if gamepad_connected else GAMEPAD_DISCONNECTED_SOUND_PATH)
 
             # Uses live button state (effective_buttons), not just new/repeat events,
             # since measuring a continuous hold needs to sample "is it down right
@@ -338,6 +345,17 @@ def mainloop(tracker, motor, start_mode="manual", debug=False, audio=None):
                 print("[mainloop] Quit button confirmed -> shutting down")
                 break
 
+            # Re-check network status periodically and (re-)announce only on an
+            # actual change -- e.g. wifi/ethernet finishing association well after
+            # the startup check gave up and reported "no network" (see
+            # NETWORK_RECHECK_INTERVAL_S), or a cable/network dropping out later.
+            if time.monotonic() - last_network_check_time >= NETWORK_RECHECK_INTERVAL_S:
+                last_network_check_time = time.monotonic()
+                connected_types, connected, wifi_names = _check_network_once()
+                if connected_types != last_network_types or wifi_names != last_network_wifi_names:
+                    last_network_types, last_network_wifi_names = connected_types, wifi_names
+                    _announce_network(audio, connected_types, connected, wifi_names)
+
             sensors.read()  # TODO: react to sensor state (e.g. obstacle stop) once wired up
 
             if mode is Mode.FOLLOW_BALL:
@@ -379,7 +397,7 @@ def mainloop(tracker, motor, start_mode="manual", debug=False, audio=None):
                     motor.drive_lr(left=left, right=right)
             elif mode is Mode.MANUAL:
                 left, right = command_handler.left, command_handler.right
-                debug_print(
+                print(    # debug_print(
                     f"[mainloop] MANUAL: motor.drive_lr(left={left:.3f}, right={right:.3f}) "
                     f"(throttle={command_handler.throttle:.3f}, steering={command_handler.steering:.3f})"
                 )
@@ -402,6 +420,7 @@ def mainloop(tracker, motor, start_mode="manual", debug=False, audio=None):
         audio.play(SHUTDOWN_SOUND_PATH)
         audio.wait_for_sound(timeout=4)
         motor.close()
+        controller.close()
         tracker.stop()
         audio.close()
         if not window_closed:
@@ -411,8 +430,15 @@ def mainloop(tracker, motor, start_mode="manual", debug=False, audio=None):
                 pass
 
 
-NETWORK_CHECK_RETRY_INTERVAL_S = 1.0  # how often to re-check while waiting for a connection
-NETWORK_CHECK_TIMEOUT_S = 12.0  # give up and report "no network" after this long
+NETWORK_CHECK_RETRY_INTERVAL_S = 1.0  # how often to re-check while waiting for a connection at startup
+NETWORK_CHECK_TIMEOUT_S = 12.0  # give up waiting and announce whatever's true after this long
+
+# Wifi (and even ethernet, e.g. DHCP) can still take longer than
+# NETWORK_CHECK_TIMEOUT_S to finish associating after boot -- so the startup
+# check alone can permanently announce "no network" even though the bot is
+# online moments later. mainloop() re-checks every this many seconds and
+# (re-)announces only if the result actually changed -- see _announce_network().
+NETWORK_RECHECK_INTERVAL_S = 30.0
 
 
 def _check_network_once():
@@ -446,6 +472,29 @@ def _check_network_once():
     return connected_types, connected, wifi_names
 
 
+def _announce_network(audio, connected_types, connected, wifi_names):
+    """Log the given network check result and, if audio is given, play a sound
+    for each connected interface -- ethernet then wifi, queued one after the
+    other, if both are connected -- or the no-network sound if neither is. A
+    wifi connection whose network name matches NETWORK_NAME_SOUND_PATHS plays
+    that clip instead of the generic wifi-connected one (see _wifi_sound_path)."""
+    if connected:
+        print(f"[network] Connected: {', '.join(connected)}")
+    else:
+        print("[network] No wifi/ethernet connection detected.")
+
+    if audio is not None:
+        # queue(), not play() -- this runs first in practice, but queue() still
+        # can't ever cut off something already playing/queued, unlike play().
+        # Both get queued (not elif) so both are announced when both are connected.
+        if "ethernet" in connected_types:
+            audio.queue(ETHERNET_CONNECTED_SOUND_PATH, pause_after=True)
+        if "wifi" in connected_types:
+            audio.queue(_wifi_sound_path(wifi_names), pause_after=True)
+        if not connected_types:
+            audio.queue(NO_NETWORK_SOUND_PATH, pause_after=True)
+
+
 def _wifi_sound_path(wifi_names):
     """Return the NETWORK_NAME_SOUND_PATHS entry for the first connected wifi
     network name that matches (case-insensitively), or WIFI_CONNECTED_SOUND_PATH
@@ -461,37 +510,24 @@ def _log_network_status(audio=None):
     """Best-effort: log which network interfaces (wifi/ethernet) are connected,
     to what, and the device's IP address(es) -- useful from the startup log for
     diagnosing "why can't I SSH/VNC in" without needing a monitor on the bot.
-    If audio is given, also plays a sound reflecting the result: ethernet takes
-    priority over wifi if both are connected, else the no-network sound. A wifi
-    connection whose network name matches NETWORK_NAME_SOUND_PATHS plays that
-    clip instead of the generic wifi-connected one (see _wifi_sound_path).
+    See _announce_network() for what gets logged/played.
 
     This runs right at process start, which on a fresh boot can race NetworkManager
-    still associating with wifi -- so a single immediate check can catch it
-    mid-connect and wrongly report "no network" a moment before it actually
-    connects. To avoid that false negative, retry every
-    NETWORK_CHECK_RETRY_INTERVAL_S until something's connected or
-    NETWORK_CHECK_TIMEOUT_S runs out, and only report/announce the final result."""
+    still associating with wifi (or even ethernet's own DHCP) -- so a single
+    immediate check can catch it mid-connect and wrongly report "no network" a
+    moment before it actually connects. To reduce that false negative, retry
+    every NETWORK_CHECK_RETRY_INTERVAL_S until something's connected or
+    NETWORK_CHECK_TIMEOUT_S runs out, and announce whatever the final result is.
+    Returns (connected_types, wifi_names) so the caller (mainloop()) can seed its
+    own baseline for NETWORK_RECHECK_INTERVAL_S's later re-checks, rather than
+    that first re-check always re-announcing this same result again."""
     deadline = time.monotonic() + NETWORK_CHECK_TIMEOUT_S
     connected_types, connected, wifi_names = _check_network_once()
     while not connected_types and time.monotonic() < deadline:
         time.sleep(NETWORK_CHECK_RETRY_INTERVAL_S)
         connected_types, connected, wifi_names = _check_network_once()
 
-    if connected:
-        print(f"[network] Connected: {', '.join(connected)}")
-    else:
-        print("[network] No wifi/ethernet connection detected.")
-
-    if audio is not None:
-        # queue(), not play() -- this runs first in practice, but queue() still
-        # can't ever cut off something already playing/queued, unlike play().
-        if "ethernet" in connected_types:
-            audio.queue(ETHERNET_CONNECTED_SOUND_PATH, pause_after=True)
-        elif "wifi" in connected_types:
-            audio.queue(_wifi_sound_path(wifi_names), pause_after=True)
-        else:
-            audio.queue(NO_NETWORK_SOUND_PATH, pause_after=True)
+    _announce_network(audio, connected_types, connected, wifi_names)
 
     try:
         ip_result = subprocess.run(["hostname", "-I"], capture_output=True, text=True, timeout=5)
@@ -500,6 +536,8 @@ def _log_network_status(audio=None):
             print(f"[network] IP address(es): {', '.join(ips)}")
     except (OSError, subprocess.SubprocessError) as e:
         print(f"[network] IP address check failed: {e}", file=sys.stderr)
+
+    return connected_types, wifi_names
 
 
 # Raised by IMX500(...) when no AI camera is attached. Checked explicitly below so an
@@ -563,10 +601,10 @@ def main():
     sys.stdout.reconfigure(line_buffering=True)
     sys.stderr.reconfigure(line_buffering=True)
     audio = TrackbotAudio()  # shared across the network-status check and mainloop()
-    _log_network_status(audio)
+    network_state = _log_network_status(audio)
     args = get_args()
     tracker, motor = init(args)
-    mainloop(tracker, motor, start_mode=args.start_mode, debug=args.debug, audio=audio)
+    mainloop(tracker, motor, start_mode=args.start_mode, debug=args.debug, audio=audio, network_state=network_state)
 
 
 if __name__ == "__main__":

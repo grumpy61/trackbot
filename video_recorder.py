@@ -114,8 +114,23 @@ class VideoRecorder:
         # whole program -- because the camera had actually been stopped and nothing ever
         # restarted it. start_encoder()/stop_encoder() only touch the encoder, leaving the
         # camera (and everything else reading from it) running the whole time.
+        #
+        # movflags=frag_keyframe+empty_moov+default_base_moof writes a minimal moov up
+        # front and periodically flushes self-contained moof/mdat fragments as frames
+        # arrive, instead of the regular MP4 muxer's default of writing NO index at all
+        # until the file is cleanly closed. Without this, any recording in progress when
+        # the process dies without reaching that clean close -- a crash, `kill -9`, a
+        # system reboot losing bluetooth mid-drive -- permanently loses the whole file:
+        # VLC (and everything else) reports "moov atom not found" and won't play a single
+        # frame of it, even though the actual video bytes are sitting right there in
+        # mdat. Reproduced directly: a fragmented recording killed with kill -9 mid-write
+        # stayed fully valid and playable up to the last flushed fragment; the same
+        # recording without these options was unplayable in exactly the same way as the
+        # corrupted files found in ~/Videos/Trackbot. A clean pause()/stop() still closes
+        # the file normally either way -- this only changes what survives an unclean one.
+        options = {"movflags": "frag_keyframe+empty_moov+default_base_moof"}
         self._encoder = H264Encoder()
-        self._picam2.start_encoder(self._encoder, PyavOutput(str(path)), name="main")
+        self._picam2.start_encoder(self._encoder, PyavOutput(str(path), options=options), name="main")
         self._recording = True
         self._segment_start = time.monotonic()
         self._current_path = path

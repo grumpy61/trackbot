@@ -198,7 +198,9 @@ class BotCommandHandler:
             self._stop_hold_start = None
 
     def process_command(self, command):
-        """command is a bot_gamepad.GamepadState (buttons + axes dicts)."""
+        """command is a bot_gamepad.GamepadState (buttons + axes dicts).
+            Sets the bot's throttle and steering based on the current button states.
+            Does NOT actually send commands to the motors; it only updates the internal state."""
         buttons = command.buttons
 
         self._recording_toggle.update(buttons.get(BTN_L_RECORD_TOGGLE, False))
