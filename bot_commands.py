@@ -66,7 +66,7 @@ THROTTLE_RAMP_STEP = (THROTTLE_MAX - THROTTLE_FLOOR) / THROTTLE_RAMP_PRESSES
 # motor's actual output straight there (e.g. the 0 -> THROTTLE_FLOOR floor jump)
 # is an abrupt jolt. Smooth it out into small steps paced by wall-clock time (via
 # tick(), called every mainloop iteration) instead of one big jump per press.
-THROTTLE_SMOOTH_INTERVAL_S = 0.5
+THROTTLE_SMOOTH_INTERVAL_S = 0.1
 THROTTLE_SMOOTH_STEP = 0.5
 
 THROTTLE_TOTAL_PRESSES = THROTTLE_DEAD_PRESSES + 1 + THROTTLE_RAMP_PRESSES  # zero to full throttle

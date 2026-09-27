@@ -8,7 +8,7 @@ dependencies). TrackbotWindow doesn't run its own blocking mainloop; call
 tick() once per iteration of the caller's own loop (e.g. run_trackbot.py's
 mainloop()) to pump pending GUI events without blocking anything else.
 
-Currently shows a mode-status label pinned to the upper-right corner, a Quit
+Currently shows mode/video/gamepad status labels pinned to the upper-right corner, a Quit
 button (with a confirmation dialog) in the lower-right, and a virtual gamepad
 (D-pad + X/A/B/Y + triggers) filling most of the window. The virtual gamepad's
 buttons update self.virtual_buttons (keyed by the same evdev keycodes
@@ -69,6 +69,11 @@ class TrackbotWindow:
             self.root, text="Video: --", font=("TkDefaultFont", 12, "bold"),
         )
         self.video_label.place(relx=1.0, y=36, x=-8, anchor="ne")
+
+        self.gamepad_label = tk.Label(
+            self.root, text="Gamepad: --", font=("TkDefaultFont", 12, "bold"),
+        )
+        self.gamepad_label.place(relx=1.0, y=64, x=-8, anchor="ne")
 
         self.quit_button = tk.Button(self.root, text="Quit", command=self._on_quit_clicked)
         self.quit_button.place(relx=1.0, rely=1.0, x=-8, y=-8, anchor="se")
@@ -227,6 +232,11 @@ class TrackbotWindow:
         """Update the video-status text below the mode status. status is
         typically one of "On", "Off", "Recording"."""
         self.video_label.config(text=f"Video: {status}")
+
+    def set_gamepad_status(self, status):
+        """Update the gamepad-status text below the video status. status is
+        typically "Connected" or "Not connected"."""
+        self.gamepad_label.config(text=f"Gamepad: {status}")
 
     def _on_quit_clicked(self):
         if messagebox.askyesno(

@@ -20,11 +20,14 @@ import argparse
 import random
 import subprocess
 import sys
+import threading
 import time
 import tkinter as tk
 from enum import Enum, auto
 
-from bot_commands import BotCommandHandler, STOP_HOLD_SHUTDOWN_S
+from bot_commands import (
+    BotCommandHandler, STOP_HOLD_SHUTDOWN_S, SPEED_GAIN, THROTTLE_FLOOR, THROTTLE_RAMP_STEP,
+)
 from bot_gamepad import BTGamepadController, GamepadState
 from bot_motor import BotMotor
 from plain_camera import PlainCameraViewer
@@ -48,15 +51,23 @@ class SensorHub:
 
 
 FOLLOW_TARGET_SIZE_FRAC = 0.05  # fallback target size, used until FOLLOW_SIZE_HISTORY_MIN_SAMPLES is reached
-FOLLOW_MAX_THROTTLE = 0.4  # conservative cap until this is tuned on real hardware
 
-# Once the tracker has seen at least this many accepted detections, drive toward
-# its running average size (tracker.avg_size_frac) instead of the fixed
-# FOLLOW_TARGET_SIZE_FRAC guess -- "the ball looks small/far compared to what
-# it's typically looked like" rather than a hardcoded distance. Below this many
-# samples there isn't enough of a size history to judge "far" against yet, so
-# _follow_ball_throttle_steering() falls back to the fixed target.
+# Forward drive while chasing: any forward command is at least FOLLOW_MIN_THROTTLE
+# (the drive power that first clears the motors' deadband -- manual driving's
+# first moving throttle step times its gain), scaling up to FOLLOW_MAX_THROTTLE
+# for a ball that looks very far. The max is the old 0.4 cap plus four manual
+# throttle steps, for a more aggressive chase.
+FOLLOW_MIN_THROTTLE = THROTTLE_FLOOR * SPEED_GAIN
+FOLLOW_MAX_THROTTLE = 0.4 + 4 * THROTTLE_RAMP_STEP
+
+# Once the tracker has seen at least this many accepted detections, "far away"
+# is judged against the sizes it has actually seen: the ball counts as far (so
+# the bot drives forward) while it's smaller than FOLLOW_FAR_FRACTION_OF_MAX of
+# the largest size seen so far (tracker.max_size_frac). Below this many samples
+# there isn't enough size history to judge against yet, so
+# _follow_ball_throttle_steering() falls back to the fixed FOLLOW_TARGET_SIZE_FRAC.
 FOLLOW_SIZE_HISTORY_MIN_SAMPLES = 10
+FOLLOW_FAR_FRACTION_OF_MAX = 0.66
 
 # Ball within this much of center (normalized dx, 0..1) is treated as "centered"
 # -- no steering correction at all, rather than constantly micro-steering at the
@@ -133,23 +144,25 @@ def _follow_ball_steering(dx):
 
 def _follow_ball_throttle_steering(result, tracker):
     """First-pass proportional control law: steer toward the ball's dx (once outside
-    the FOLLOW_CENTER_DEADBAND), move forward proportional to how much smaller than
-    the target size the box is, and stop (no reverse) once it's at/above target
-    size. Needs tuning on real hardware.
+    the FOLLOW_CENTER_DEADBAND), drive forward while the ball looks smaller (farther)
+    than the target size, and stop (no reverse) once it's at/above it. Needs tuning
+    on real hardware.
 
-    The target size is tracker.avg_size_frac (the average of every accepted
-    detection so far -- see YellowBallTracker.tick()) once there have been at
-    least FOLLOW_SIZE_HISTORY_MIN_SAMPLES of them, so "the ball looks far away"
-    means small relative to how it's actually usually looked, not a fixed
-    guess -- before that many samples exist there isn't enough of a size
-    history to judge against, so it falls back to FOLLOW_TARGET_SIZE_FRAC."""
+    The target size is FOLLOW_FAR_FRACTION_OF_MAX of the largest size the tracker
+    has seen (tracker.max_size_frac) once there have been at least
+    FOLLOW_SIZE_HISTORY_MIN_SAMPLES detections -- so "far" is relative to how big
+    the ball has actually looked, not a fixed guess -- else the fixed
+    FOLLOW_TARGET_SIZE_FRAC. Forward throttle then runs from FOLLOW_MIN_THROTTLE
+    (just at the target) up to FOLLOW_MAX_THROTTLE (ball tiny)."""
     steering = _follow_ball_steering(result.dx)
     if tracker.size_sample_count >= FOLLOW_SIZE_HISTORY_MIN_SAMPLES:
-        target_size = tracker.avg_size_frac
+        target_size = FOLLOW_FAR_FRACTION_OF_MAX * tracker.max_size_frac
     else:
         target_size = FOLLOW_TARGET_SIZE_FRAC
-    gap = (target_size - result.size_frac) / target_size
-    throttle = max(0.0, min(1.0, gap)) * FOLLOW_MAX_THROTTLE
+    if result.size_frac >= target_size:
+        return 0.0, steering
+    gap = (target_size - result.size_frac) / target_size  # 0..1, bigger = farther
+    throttle = FOLLOW_MIN_THROTTLE + (FOLLOW_MAX_THROTTLE - FOLLOW_MIN_THROTTLE) * gap
     return throttle, steering
 
 
@@ -179,6 +192,10 @@ def get_args():
 # and mainloop have settled was observed to hang the whole program.
 RECORD_AUTOSTART_DELAY_S = 1.0
 
+# Pause per MANUAL/IDLE loop pass. Kept short: gamepad events are only read once
+# per pass, so this is the floor on input latency.
+MAINLOOP_IDLE_SLEEP_S = 0.01
+
 
 def mainloop(tracker, motor, start_mode="manual", debug=False, audio=None, network_state=None):
     if audio is None:
@@ -192,6 +209,7 @@ def mainloop(tracker, motor, start_mode="manual", debug=False, audio=None, netwo
     window.set_mode(base_mode.name)
     window.set_video_status("Recording" if tracker.video_recorder.recording else "Off")
     last_debug_msg = None
+    last_manual_msg = None  # last MANUAL-mode drive message printed, so it isn't repeated when unchanged
     last_recording_state = tracker.video_recorder.recording
     last_follow_state = command_handler.follow_ball
     last_mode = base_mode  # for logging entering/leaving ball tracking mode below
@@ -212,6 +230,8 @@ def mainloop(tracker, motor, start_mode="manual", debug=False, audio=None, netwo
     # thing again; (set(), []) if it wasn't given one (e.g. a test harness).
     last_network_types, last_network_wifi_names = network_state or (set(), [])
     last_network_check_time = time.monotonic()
+    network_check_thread = None  # background nmcli re-check in flight, if any
+    network_check_result = []  # its (connected_types, connected, wifi_names), once done
 
     # Announce the gamepad's connection state as of startup, then again on every
     # change (BTGamepadController.poll() reconnects/disconnects automatically).
@@ -219,6 +239,7 @@ def mainloop(tracker, motor, start_mode="manual", debug=False, audio=None, netwo
     # (also queued, in _log_network_status()) instead of cutting it off if it's
     # still playing.
     gamepad_was_connected = controller.device is not None
+    window.set_gamepad_status("Connected" if gamepad_was_connected else "Not connected")
     print(f"[mainloop] Gamepad {'connected' if gamepad_was_connected else 'not connected'} at startup")
     audio.queue(GAMEPAD_CONNECTED_SOUND_PATH if gamepad_was_connected else GAMEPAD_DISCONNECTED_SOUND_PATH,
                 pause_after=True)
@@ -257,8 +278,18 @@ def mainloop(tracker, motor, start_mode="manual", debug=False, audio=None, netwo
             for keycode, pressed in window.virtual_buttons.items():
                 if pressed:
                     effective_buttons[keycode] = True
-            if effective_buttons != last_effective_buttons or controller.state.repeat_codes:
+            repeat_codes = controller.state.repeat_codes
+            if effective_buttons != last_effective_buttons or repeat_codes:
                 last_effective_buttons = effective_buttons
+                # A quick tap can press AND release within one poll() batch, so the
+                # live state already shows it released and the press would be lost
+                # entirely. Show process_command() the press first, then the real
+                # (released) state so its press/release edge detection resets.
+                missed_taps = {c for c in repeat_codes if not effective_buttons.get(c, False)}
+                if missed_taps:
+                    tap_buttons = dict(effective_buttons)
+                    tap_buttons.update({c: True for c in missed_taps})
+                    command_handler.process_command(GamepadState(buttons=tap_buttons))
                 command_handler.process_command(GamepadState(buttons=effective_buttons))
             command_handler.tick()  # ease throttle toward its target, independent of new events
 
@@ -272,6 +303,11 @@ def mainloop(tracker, motor, start_mode="manual", debug=False, audio=None, netwo
             gamepad_connected = controller.device is not None
             if gamepad_connected != gamepad_was_connected:
                 gamepad_was_connected = gamepad_connected
+                if not window_closed:
+                    try:
+                        window.set_gamepad_status("Connected" if gamepad_connected else "Not connected")
+                    except tk.TclError:
+                        pass  # window was closed; tick() below notices and stops touching it
                 print(f"[mainloop] Gamepad {'connected' if gamepad_connected else 'disconnected'}")
                 audio.queue(GAMEPAD_CONNECTED_SOUND_PATH if gamepad_connected else GAMEPAD_DISCONNECTED_SOUND_PATH)
                 if not gamepad_connected:
@@ -322,6 +358,11 @@ def mainloop(tracker, motor, start_mode="manual", debug=False, audio=None, netwo
                     audio.queue(VIDEO_OFF_SOUND_PATH)
                     window.set_video_status("Off")
 
+            # Drives the SEGMENT_SECONDS file rollover. tracker.tick() only does this in
+            # FOLLOW_BALL mode, so without this call a recording made in MANUAL/IDLE
+            # never rolled over and grew into one multi-GB file (seen: 2.6 GB / 2.4 h).
+            tracker.video_recorder.tick()
+
             # Announce changes in ball-following state
             if command_handler.follow_ball != last_follow_state:
                 last_follow_state = command_handler.follow_ball
@@ -368,12 +409,21 @@ def mainloop(tracker, motor, start_mode="manual", debug=False, audio=None, netwo
             # actual change -- e.g. wifi/ethernet finishing association well after
             # the startup check gave up and reported "no network" (see
             # NETWORK_RECHECK_INTERVAL_S), or a cable/network dropping out later.
-            if time.monotonic() - last_network_check_time >= NETWORK_RECHECK_INTERVAL_S:
+            # The nmcli query runs on its own thread so a slow/hung call can't stall
+            # the drive loop; its result is picked up on a later pass.
+            if network_check_thread is not None and not network_check_thread.is_alive():
+                network_check_thread = None
+                if network_check_result:
+                    connected_types, connected, wifi_names = network_check_result.pop()
+                    if connected_types != last_network_types or wifi_names != last_network_wifi_names:
+                        last_network_types, last_network_wifi_names = connected_types, wifi_names
+                        _announce_network(audio, connected_types, connected, wifi_names)
+            if (network_check_thread is None
+                    and time.monotonic() - last_network_check_time >= NETWORK_RECHECK_INTERVAL_S):
                 last_network_check_time = time.monotonic()
-                connected_types, connected, wifi_names = _check_network_once()
-                if connected_types != last_network_types or wifi_names != last_network_wifi_names:
-                    last_network_types, last_network_wifi_names = connected_types, wifi_names
-                    _announce_network(audio, connected_types, connected, wifi_names)
+                network_check_thread = threading.Thread(
+                    target=lambda: network_check_result.append(_check_network_once()), daemon=True)
+                network_check_thread.start()
 
             sensors.read()  # TODO: react to sensor state (e.g. obstacle stop) once wired up
 
@@ -416,16 +466,19 @@ def mainloop(tracker, motor, start_mode="manual", debug=False, audio=None, netwo
                     motor.drive_lr(left=left, right=right)
             elif mode is Mode.MANUAL:
                 left, right = command_handler.left, command_handler.right
-                print(    # debug_print(
+                manual_msg = (
                     f"[mainloop] MANUAL: motor.drive_lr(left={left:.3f}, right={right:.3f}) "
                     f"(throttle={command_handler.throttle:.3f}, steering={command_handler.steering:.3f})"
                 )
+                if manual_msg != last_manual_msg:  # this loop runs ~20x/s -- only print on change
+                    print(manual_msg)
+                    last_manual_msg = manual_msg
                 motor.drive_lr(left=left, right=right)
-                time.sleep(0.05)
+                time.sleep(MAINLOOP_IDLE_SLEEP_S)
             else:  # Mode.IDLE
                 debug_print("[mainloop] IDLE: motor.stop()")
                 motor.stop()
-                time.sleep(0.05)
+                time.sleep(MAINLOOP_IDLE_SLEEP_S)
     except KeyboardInterrupt:
         pass
     finally:
