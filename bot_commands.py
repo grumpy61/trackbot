@@ -57,7 +57,8 @@ STOP_HOLD_SHUTDOWN_S = 3.0
 # floor on the 3rd, then ramp up to the 1.0 speed limit over further presses --
 # 20 presses (steps) stop-to-max overall.
 THROTTLE_DEAD_PRESSES = 2    # presses with the bot held at 0 before the floor kicks in
-THROTTLE_FLOOR = 0.35        # value assigned on the press that first clears the deadband (0.55 * 0.7)
+THROTTLE_FLOOR = 0.245       # value assigned on the press that first clears the deadband (0.35 * 0.7,
+                             # lowered ~30% for the stronger Pololu motors -- they need less to start)
 THROTTLE_MAX = 1.0           # speed limit / ceiling
 THROTTLE_RAMP_PRESSES = 17   # further presses from floor to max (2 dead + 1 floor + 17 = 20 total)
 THROTTLE_RAMP_STEP = (THROTTLE_MAX - THROTTLE_FLOOR) / THROTTLE_RAMP_PRESSES
@@ -85,9 +86,9 @@ THROTTLE_TOTAL_PRESSES = THROTTLE_DEAD_PRESSES + 1 + THROTTLE_RAMP_PRESSES  # ze
 # (throttle magnitude, diff, min_inside). Below the first / above the last row
 # the nearest row's values are used. Tune slow/medium/fast turning here.
 STEERING_TABLE = (
-    (0.35, 0.75, 0.25),  # slow    -- just above the deadband floor
-    (0.65, 0.85, 0.20),  # medium
-    (1.00, 0.85, 0.25),  # fast    -- outside track is capped at 1.0, so the inside can't drop as far
+    (0.35, 1.00, 0.15),  # slow    -- just above the deadband floor
+    (0.65, 1.00, 0.12),  # medium
+    (1.00, 1.00, 0.15),  # fast    -- outside track is capped at 1.0, so the inside can't drop as far
 )
 
 
@@ -228,10 +229,18 @@ class BotCommandHandler:
         # Steering holds its last direction when the button is released (only
         # X/STRAIGHT or STOP recenters it); zeroing it on release made taps of
         # LEFT/RIGHT cancel themselves out before the bot could turn.
-        if right and not left:
-            self.steering = 1.0
-        elif left and not right:
-            self.steering = -1.0
+        desired = 1.0 if (right and not left) else (-1.0 if (left and not right) else None)
+        if desired is not None:
+            if self.steering != 0.0 and (desired > 0) != (self.steering > 0):
+                # The opposite direction was pressed while already steering the
+                # other way -- pass through zero first rather than snapping
+                # straight to the new direction, so the tracks resync (both
+                # back to equal speed) before the new turn is applied. Call it
+                # again (e.g. the gamepad's own HELD repeat while still held)
+                # to actually pick up the new direction once steering is 0.
+                self.steering = 0.0
+            else:
+                self.steering = desired
 
     def stop_all(self):
         """Immediately zero throttle and steering (no easing), and leave

@@ -9,7 +9,8 @@ cd "$(dirname "$0")" || exec bash
 
 # Play a startup chime in the background so it doesn't delay the rest of setup.
 # --volume 0.9 matches trackbot_audio.py's PLAYBACK_VOLUME.
-pw-play --volume 0.9 ./sounds/startingtrackbot.wav &
+# pw-play --volume 0.9 ./sounds/startingtrackbot.wav &
+pw-play --volume 0.9 ./sounds/iamawake.wav &
 
 LOG_DIR="/home/trackbot/Documents/TrackBotLogs"
 LOG_FILE="$LOG_DIR/trackbot_$(date +%Y-%m-%d_%H-%M-%S).log"
