@@ -24,6 +24,7 @@ BTN_RIGHT = ecodes.KEY_F
 # X, Y, A, B buttons
 BTN_A_STOP = ecodes.KEY_G
 BTN_X_STRAIGHT = ecodes.KEY_H           # Zero steering
+BTN_B_RANDOM_SOUNDS = ecodes.KEY_J        # Play a random sound from RANDOM_SOUNDS_BUTTON_PATHS
 BTN_L_RECORD_TOGGLE = ecodes.KEY_K      # Video recording on/off
 BTN_R_FOLLOW_TOGGLE = ecodes.KEY_M      # Ball-following (Mode.FOLLOW_BALL) on/off
 
@@ -42,6 +43,12 @@ QUICK_CLICK_WINDOW_S = 0.6
 # with effective_buttons (the real gamepad merged with the virtual window's).
 STOP_HOLD_SHUTDOWN_S = 3.0
 
+# Holding BTN_B_RANDOM_SOUNDS (not just tapping it) this long requests cycling
+# RANDOM_SOUNDS_BUTTON_PATHS to the next folder in RANDOM_SOUNDS_FOLDERS --
+# see check_random_sounds_reload_hold()/consume_random_sounds_reload_request()
+# below, and run_trackbot.py's mainloop.
+RANDOM_SOUNDS_RELOAD_HOLD_S = 3.0
+
 # Throttle is a ratchet: each press of the relevant key steps the target up by
 # one rung (see _update_throttle_target), and releasing the key just holds at
 # the current rung rather than decaying back toward zero. Only an explicit
@@ -56,7 +63,7 @@ STOP_HOLD_SHUTDOWN_S = 3.0
 # stay at 0 for the first two presses, jump straight to the deadband-clearing
 # floor on the 3rd, then ramp up to the 1.0 speed limit over further presses --
 # 20 presses (steps) stop-to-max overall.
-THROTTLE_DEAD_PRESSES = 2    # presses with the bot held at 0 before the floor kicks in
+THROTTLE_DEAD_PRESSES = 1    # presses with the bot held at 0 before the floor kicks in
 THROTTLE_FLOOR = 0.245       # value assigned on the press that first clears the deadband (0.35 * 0.7,
                              # lowered ~30% for the stronger Pololu motors -- they need less to start)
 THROTTLE_MAX = 1.0           # speed limit / ceiling
@@ -170,6 +177,13 @@ class BotCommandHandler:
         self._follow_toggle = _QuickClickToggle()
         self.shutdown_requested = False
         self._stop_hold_start = None
+        self.random_sound_requested = False  # fresh press of BTN_B_RANDOM_SOUNDS -- see consume_random_sound_request()
+        self._random_sound_was_down = False
+        self._random_sounds_reload_hold_start = None
+        self._random_sounds_reload_fired = False  # so a long hold only requests one reload, not one per iteration
+        self.random_sounds_reload_requested = False  # see consume_random_sounds_reload_request()
+        self._volume_adjusted_this_press = False  # UP/DOWN used as a volume modifier during this B hold --
+        self.volume_delta_requested = 0           # suppresses the other two B behaviors on release; see process_command
 
     @property
     def recording(self):
@@ -198,6 +212,26 @@ class BotCommandHandler:
         else:
             self._stop_hold_start = None
 
+    def check_random_sounds_reload_hold(self, buttons):
+        """Call every mainloop iteration with the gamepad's live button state --
+        sets random_sounds_reload_requested once BTN_B_RANDOM_SOUNDS has been
+        held continuously for RANDOM_SOUNDS_RELOAD_HOLD_S. Fires once per hold
+        (not repeatedly for as long as it stays held) -- releasing re-arms it.
+        Suppressed entirely if UP/DOWN was used as a volume modifier during
+        this same hold (see process_command/_volume_adjusted_this_press)."""
+        if buttons.get(BTN_B_RANDOM_SOUNDS, False):
+            if self._random_sounds_reload_hold_start is None:
+                self._random_sounds_reload_hold_start = time.monotonic()
+            elif (not self._random_sounds_reload_fired
+                    and not self._volume_adjusted_this_press
+                    and time.monotonic() - self._random_sounds_reload_hold_start >= RANDOM_SOUNDS_RELOAD_HOLD_S):
+                self._random_sounds_reload_fired = True
+                self.random_sounds_reload_requested = True
+        else:
+            self._random_sounds_reload_hold_start = None
+            self._random_sounds_reload_fired = False
+            self._volume_adjusted_this_press = False
+
     def process_command(self, command):
         """command is a bot_gamepad.GamepadState (buttons + axes dicts).
             Sets the bot's throttle and steering based on the current button states.
@@ -206,6 +240,20 @@ class BotCommandHandler:
 
         self._recording_toggle.update(buttons.get(BTN_L_RECORD_TOGGLE, False))
         self._follow_toggle.update(buttons.get(BTN_R_FOLLOW_TOGGLE, False))
+
+        random_sound_down = buttons.get(BTN_B_RANDOM_SOUNDS, False)
+        if random_sound_down and not self._random_sound_was_down:
+            self._volume_adjusted_this_press = False  # fresh press -- start a clean episode
+        if (not random_sound_down and self._random_sound_was_down
+                and not self._random_sounds_reload_fired
+                and not self._volume_adjusted_this_press):
+            # Fires on release, not on press -- excluded if this hold instead
+            # fired the folder-reload (_random_sounds_reload_fired) or was
+            # used as a volume modifier (_volume_adjusted_this_press), so
+            # releasing after either doesn't also queue a sound.
+            # consume_random_sound_request() is how a caller picks this up.
+            self.random_sound_requested = True
+        self._random_sound_was_down = random_sound_down
 
         if buttons.get(BTN_A_STOP, False):
             # Immediate stop/zero, bypassing the eased ramp and the smoothing.
@@ -222,6 +270,21 @@ class BotCommandHandler:
         down = buttons.get(BTN_DOWN, False)
         left = buttons.get(BTN_LEFT, False)
         right = buttons.get(BTN_RIGHT, False)
+
+        if random_sound_down:
+            # B held: UP/DOWN become a volume modifier instead of driving --
+            # also marks this press episode as "used for volume" (see above)
+            # so releasing B afterward doesn't also play a sound or (if held
+            # long enough) reload the sound folder. Throttle/steering are left
+            # exactly as they were; nothing below this point runs while B is
+            # held, so holding it also pauses normal D-pad driving.
+            if up and not down:
+                self.volume_delta_requested += 1
+                self._volume_adjusted_this_press = True
+            elif down and not up:
+                self.volume_delta_requested -= 1
+                self._volume_adjusted_this_press = True
+            return
 
         throttle_target = float(up) - float(down)
         self._update_throttle_target(throttle_target)
@@ -241,6 +304,28 @@ class BotCommandHandler:
                 self.steering = 0.0
             else:
                 self.steering = desired
+
+    def consume_random_sound_request(self):
+        """True exactly once per physical press of BTN_B_RANDOM_SOUNDS, then clears
+        it -- call once per mainloop iteration so a press plays a sound exactly
+        once, not every iteration until something else changes."""
+        requested = self.random_sound_requested
+        self.random_sound_requested = False
+        return requested
+
+    def consume_random_sounds_reload_request(self):
+        """True exactly once per long hold of BTN_B_RANDOM_SOUNDS, then clears
+        it -- see check_random_sounds_reload_hold()."""
+        requested = self.random_sounds_reload_requested
+        self.random_sounds_reload_requested = False
+        return requested
+
+    def consume_volume_delta(self):
+        """Net +1/-1 steps requested since the last call (B held + UP/DOWN --
+        see process_command), then clears it."""
+        delta = self.volume_delta_requested
+        self.volume_delta_requested = 0
+        return delta
 
     def stop_all(self):
         """Immediately zero throttle and steering (no easing), and leave

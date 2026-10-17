@@ -24,9 +24,11 @@ import threading
 import time
 import tkinter as tk
 from enum import Enum, auto
+from pathlib import Path
 
 from bot_commands import (
     BotCommandHandler, STOP_HOLD_SHUTDOWN_S, SPEED_GAIN, THROTTLE_FLOOR, THROTTLE_RAMP_STEP,
+    BTN_B_RANDOM_SOUNDS,
 )
 from bot_gamepad import BTGamepadController, GamepadState
 from bot_motor import BotMotor
@@ -79,26 +81,96 @@ FOLLOW_FAR_FRACTION_OF_MAX = 0.66
 FOLLOW_CENTER_DEADBAND = 0.20
 
 # Played when a new ball is detected -- one is picked at random each time so it
-# doesn't get repetitive.
-BALL_SOUND_PATHS = [
-    "./sounds/ball.wav",
-    "./sounds/ifoundtheball.wav",
-    "./sounds/igotit.wav",
-    "./sounds/therestheball.wav",
-    "./sounds/getball.wav",
-    "./sounds/dogbark3x.wav",
-]
+# doesn't get repetitive. Populated at startup by load_ball_sounds() below, from
+# every .wav file found in ./sounds/BALL_FOUND_SOUNDS_DIR.
+BALL_SOUND_PATHS = []
+BALL_FOUND_SOUNDS_DIR = "ballfound"
+BALL_FOUND_SOUNDS_DEFAULT = ["./sounds/ball.wav"]  # used if that folder is missing/empty
 
 # Played once after a previously-tracked ball goes missing for a while -- one is
 # picked at random, and it only plays once per "loss episode" (see ball_lost_time/
 # lost_ball_sound_played in mainloop()), not repeatedly for as long as it stays lost.
-LOST_BALL_SOUND_PATHS = [
-    "./sounds/balldisappeared.wav",
-    "./sounds/noball.wav",
-    "./sounds/whotooktheball.wav",
-    "./sounds/wherestheball.wav",
-    "./sounds/lostball.wav",
-]
+# Populated at startup by load_ball_sounds() below, from every .wav file found in
+# ./sounds/BALL_LOST_SOUNDS_DIR.
+LOST_BALL_SOUND_PATHS = []
+BALL_LOST_SOUNDS_DIR = "balllost"
+BALL_LOST_SOUNDS_DEFAULT = ["./sounds/noball.wav"]  # used if that folder is missing/empty
+
+
+def _load_sounds_into(paths_list, folder, default_paths):
+    """Clear and repopulate `paths_list` (a module-level list, mutated in place
+    so callers that already hold a reference to it keep seeing the update) with
+    every .wav file found in ./sounds/<folder>, sorted. Falls back to
+    `default_paths` if that folder is missing or has no .wav files in it, so
+    the list is never left empty."""
+    found = sorted(str(p) for p in (Path("./sounds") / folder).glob("*.wav"))
+    paths_list.clear()
+    paths_list.extend(found if found else default_paths)
+
+
+def load_ball_sounds():
+    """(Re)populate BALL_SOUND_PATHS and LOST_BALL_SOUND_PATHS from
+    ./sounds/BALL_FOUND_SOUNDS_DIR and ./sounds/BALL_LOST_SOUNDS_DIR respectively."""
+    _load_sounds_into(BALL_SOUND_PATHS, BALL_FOUND_SOUNDS_DIR, BALL_FOUND_SOUNDS_DEFAULT)
+    _load_sounds_into(LOST_BALL_SOUND_PATHS, BALL_LOST_SOUNDS_DIR, BALL_LOST_SOUNDS_DEFAULT)
+
+# Change in audio.volume per step while BTN_B_RANDOM_SOUNDS is held and UP/DOWN
+# is pressed (see command_handler.consume_volume_delta() in mainloop()).
+VOLUME_STEP = 0.10
+
+# Played on demand, once per press of BTN_B_RANDOM_SOUNDS -- one is picked at random.
+# Populated at startup (from RANDOM_SOUNDS_FOLDERS[0]) by load_random_sounds()
+# below, from every .wav file found in that folder (under ./sounds/) -- drop a
+# file in there to add it, no code change needed. Holding BTN_B_RANDOM_SOUNDS
+# for RANDOM_SOUNDS_RELOAD_HOLD_S (see bot_commands.py) cycles to the next
+# folder in this list via cycle_random_sounds_folder(), wrapping back to the
+# first after the last. Add more folder names here.
+RANDOM_SOUNDS_BUTTON_PATHS = []
+RANDOM_SOUNDS_FOLDERS = ["random", "nokings"]
+_random_sounds_folder_index = 0
+
+# Never one of the random picks in RANDOM_SOUNDS_BUTTON_PATHS -- each folder can
+# have its own copy of this exact filename, and if present it's played once
+# right after that folder is (re)loaded instead, as an audible "now using this
+# folder" cue. See load_random_sounds().
+USING_THIS_FOLDER_SOUND_NAME = "usingthisfolder.wav"
+
+
+RANDOM_SOUNDS_EXTENSIONS = ("*.wav", "*.mp3")  # pw-play (via TrackbotAudio) handles both fine
+
+
+def load_random_sounds(folder=None, audio=None):
+    """Clear and repopulate RANDOM_SOUNDS_BUTTON_PATHS with every file matching
+    RANDOM_SOUNDS_EXTENSIONS found in ./sounds/<folder> --
+    RANDOM_SOUNDS_FOLDERS[_random_sounds_folder_index] (the current folder) if
+    `folder` isn't given -- except USING_THIS_FOLDER_SOUND_NAME, which is
+    excluded from the list and, if present and `audio` is given, queued once
+    instead right after the reload. Mutates RANDOM_SOUNDS_BUTTON_PATHS in
+    place (clear + extend) rather than rebinding the name, so callers that
+    already hold a reference to it (e.g. random.choice(RANDOM_SOUNDS_BUTTON_PATHS)
+    in mainloop()) see the update too. Returns the folder name actually loaded."""
+    if folder is None:
+        folder = RANDOM_SOUNDS_FOLDERS[_random_sounds_folder_index]
+    directory = Path("./sounds") / folder
+    found = (path for pattern in RANDOM_SOUNDS_EXTENSIONS for path in directory.glob(pattern))
+    RANDOM_SOUNDS_BUTTON_PATHS.clear()
+    RANDOM_SOUNDS_BUTTON_PATHS.extend(
+        str(path) for path in sorted(found)
+        if path.name != USING_THIS_FOLDER_SOUND_NAME
+    )
+    if audio is not None:
+        using_this_folder_path = directory / USING_THIS_FOLDER_SOUND_NAME
+        if using_this_folder_path.is_file():
+            audio.queue(str(using_this_folder_path))
+    return folder
+
+
+def cycle_random_sounds_folder(audio=None):
+    """Advance to the next folder in RANDOM_SOUNDS_FOLDERS (wrapping around) and
+    reload RANDOM_SOUNDS_BUTTON_PATHS from it. Returns the new folder's name."""
+    global _random_sounds_folder_index
+    _random_sounds_folder_index = (_random_sounds_folder_index + 1) % len(RANDOM_SOUNDS_FOLDERS)
+    return load_random_sounds(audio=audio)
 
 BALL_SOUND_COOLDOWN_MIN_S = 3.0  # don't replay the sound sooner than this after the last one...
 BALL_SOUND_COOLDOWN_MAX_S = 8.0  # ...up to this long, picked at random each time (see _random_ball_sound_cooldown)
@@ -106,6 +178,15 @@ BALL_SOUND_COOLDOWN_MAX_S = 8.0  # ...up to this long, picked at random each tim
 
 def _random_ball_sound_cooldown():
     return random.uniform(BALL_SOUND_COOLDOWN_MIN_S, BALL_SOUND_COOLDOWN_MAX_S)
+
+
+def _random_choice_excluding(paths, previous):
+    """random.choice(paths), but never `previous` again if paths has more than
+    one entry -- so the same sound never plays twice in a row. Falls back to
+    plain random.choice() (previous included) when paths has only one entry,
+    so a single-sound list still works."""
+    candidates = [p for p in paths if p != previous] if len(paths) > 1 else paths
+    return random.choice(candidates)
 
 
 GAMEPAD_CONNECTED_SOUND_PATH = "./sounds/gamepadconnected.wav"
@@ -133,6 +214,7 @@ NETWORK_NAME_SOUND_PATHS = {
 }
 
 SHUTDOWN_SOUND_PATH = "./sounds/shuttingdown.wav"
+READY_SOUND_PATH = "./sounds/readytoroll.wav"  # queued right after the startup gamepad-status announcement
 
 
 def _follow_ball_steering(dx):
@@ -208,19 +290,27 @@ def mainloop(tracker, motor, start_mode="manual", debug=False, audio=None, netwo
     base_mode = Mode[start_mode.upper()]  # the mode to fall back to when FOLLOW_BALL is off
     window.set_mode(base_mode.name)
     window.set_video_status("Recording" if tracker.video_recorder.recording else "Off")
-    last_debug_msg = None
     last_manual_msg = None  # last MANUAL-mode drive message printed, so it isn't repeated when unchanged
+    last_follow_drive_msg = None  # last FOLLOW_BALL "motor.drive(...)" message, so it isn't repeated when unchanged
+    last_follow_manual_msg = None  # last FOLLOW_BALL "ball not found" message, so it isn't repeated when unchanged
+    last_idle_msg = None  # last IDLE message, so it isn't repeated every iteration while idle
     last_recording_state = tracker.video_recorder.recording
     last_follow_state = command_handler.follow_ball
     last_mode = base_mode  # for logging entering/leaving ball tracking mode below
     mainloop_start_time = time.monotonic()
     pending_record_autostart = tracker.video_recorder.enabled  # --record-preview was passed
+    ready_sound_played = False  # see "Play once video autostart has resolved" below
     ball_was_found = False
     last_ball_sound_time = -BALL_SOUND_COOLDOWN_MAX_S  # so the very first detection can play
     next_ball_sound_cooldown = _random_ball_sound_cooldown()
     ball_lost_time = None  # monotonic time the ball was last seen going missing, or None
     ball_lost_sound_delay = None  # this episode's randomly-picked delay before playing a "lost" sound
     lost_ball_sound_played = False  # so it only plays once per loss episode, not repeatedly
+    # Last pick from each of BALL_SOUND_PATHS/LOST_BALL_SOUND_PATHS/RANDOM_SOUNDS_BUTTON_PATHS,
+    # so _random_choice_excluding() never repeats the same one twice in a row.
+    last_ball_found_sound_path = None
+    last_lost_ball_sound_path = None
+    last_random_sounds_button_path = None
     last_drive_state = None  # last logged (throttle/steering/left/right) snapshot, to log only changes
     last_effective_buttons = {}  # last (real gamepad | virtual window) merged button state we acted on
     gamepad_in_use = False  # real gamepad has sent input since it (re)connected -- arms the dropout fail-safe
@@ -250,10 +340,14 @@ def mainloop(tracker, motor, start_mode="manual", debug=False, audio=None, netwo
     follow_ball_available = not isinstance(tracker, PlainCameraViewer)
 
     def debug_print(msg):
-        nonlocal last_debug_msg
-        if debug and msg != last_debug_msg:
+        # No dedup here -- callers that need "only when changed" (most of them)
+        # track their own last-printed value and only call this when it differs;
+        # a single shared last-message check doesn't work once more than one
+        # call site can fire in the same iteration (e.g. [drive] every iteration
+        # alongside a mode-specific message), since each would see the other's
+        # text as "different" and both would re-print every iteration forever.
+        if debug:
             print(msg)
-        last_debug_msg = msg
 
     try:
         while True:
@@ -285,7 +379,16 @@ def mainloop(tracker, motor, start_mode="manual", debug=False, audio=None, netwo
                 # live state already shows it released and the press would be lost
                 # entirely. Show process_command() the press first, then the real
                 # (released) state so its press/release edge detection resets.
-                missed_taps = {c for c in repeat_codes if not effective_buttons.get(c, False)}
+                # BTN_B_RANDOM_SOUNDS is excluded: it's a modifier (UP/DOWN mean
+                # volume, not throttle, while it's down -- see process_command),
+                # so replaying a vanished B-tap as "B held" for one call and "B
+                # released" for the next let a held DOWN fall through to a real
+                # throttle change on the second call -- moving the bot even though
+                # B logically never stopped being held for this interaction.
+                missed_taps = {
+                    c for c in repeat_codes
+                    if not effective_buttons.get(c, False) and c != BTN_B_RANDOM_SOUNDS
+                }
                 if missed_taps:
                     tap_buttons = dict(effective_buttons)
                     tap_buttons.update({c: True for c in missed_taps})
@@ -297,8 +400,8 @@ def mainloop(tracker, motor, start_mode="manual", debug=False, audio=None, netwo
             if drive_state != last_drive_state:
                 last_drive_state = drive_state
                 target, throttle_now, presses, steer, left_now, right_now = drive_state
-                print(f"[drive] throttle={throttle_now:.3f} (target={target:.3f}, presses={presses}) "
-                      f"steering={steer:+.0f} -> left={left_now:.3f} right={right_now:.3f}")
+                debug_print(f"[drive] throttle={throttle_now:.3f} (target={target:.3f}, presses={presses}) "
+                            f"steering={steer:+.0f} -> left={left_now:.3f} right={right_now:.3f}")
 
             gamepad_connected = controller.device is not None
             if gamepad_connected != gamepad_was_connected:
@@ -337,6 +440,12 @@ def mainloop(tracker, motor, start_mode="manual", debug=False, audio=None, netwo
                 print(f"[mainloop] 'A' button held for {STOP_HOLD_SHUTDOWN_S:g}s -> shutting down")
                 break
 
+            command_handler.check_random_sounds_reload_hold(effective_buttons)
+            if command_handler.consume_random_sounds_reload_request():
+                folder = cycle_random_sounds_folder(audio=audio)
+                print(f"[mainloop] 'B' button held -> reloaded RANDOM_SOUNDS_BUTTON_PATHS "
+                      f"from ./sounds/{folder} ({len(RANDOM_SOUNDS_BUTTON_PATHS)} files)")
+
             # Start video recording if the auto-start delay has passed
             if pending_record_autostart and time.monotonic() - mainloop_start_time >= RECORD_AUTOSTART_DELAY_S:
                 pending_record_autostart = False
@@ -358,6 +467,19 @@ def mainloop(tracker, motor, start_mode="manual", debug=False, audio=None, netwo
                     audio.queue(VIDEO_OFF_SOUND_PATH)
                     window.set_video_status("Off")
 
+            # Play once video autostart has resolved -- either it just fired above,
+            # or (if --record-preview wasn't passed) there was never anything
+            # pending, so this fires right away on the very first iteration.
+            if not ready_sound_played and time.monotonic() - mainloop_start_time >= RECORD_AUTOSTART_DELAY_S:
+                ready_sound_played = True
+                audio.queue(READY_SOUND_PATH)
+
+            # B button: play a random sound on demand, once per press
+            if command_handler.consume_random_sound_request():
+                last_random_sounds_button_path = _random_choice_excluding(
+                    RANDOM_SOUNDS_BUTTON_PATHS, last_random_sounds_button_path)
+                audio.queue(last_random_sounds_button_path)
+
             # Drives the SEGMENT_SECONDS file rollover. tracker.tick() only does this in
             # FOLLOW_BALL mode, so without this call a recording made in MANUAL/IDLE
             # never rolled over and grew into one multi-GB file (seen: 2.6 GB / 2.4 h).
@@ -377,6 +499,20 @@ def mainloop(tracker, motor, start_mode="manual", debug=False, audio=None, netwo
                     audio.queue(FOLLOWING_OFF_SOUND_PATH)
 
             mode = Mode.FOLLOW_BALL if (command_handler.follow_ball and follow_ball_available) else base_mode
+
+            # B held + UP/DOWN: volume modifier (see process_command). Adjusts
+            # audio.ball_volume (BALL_SOUND_PATHS/LOST_BALL_SOUND_PATHS) while in
+            # FOLLOW_BALL, else the general audio.volume everywhere else.
+            volume_delta = command_handler.consume_volume_delta()
+            if volume_delta:
+                if mode is Mode.FOLLOW_BALL:
+                    new_volume = audio.set_ball_volume(audio.ball_volume + volume_delta * VOLUME_STEP)
+                    label = "ball_volume"
+                else:
+                    new_volume = audio.set_volume(audio.volume + volume_delta * VOLUME_STEP)
+                    label = "volume"
+                print(f"[mainloop] 'B' + {'UP' if volume_delta > 0 else 'DOWN'} -> {label}={new_volume:.2f}")
+                audio.queue(f"./sounds/volume{round(new_volume * 100)}.wav")
 
             # Always log the actual mode boundary being crossed (not just the button
             # press above), so this stays correct regardless of what triggers a change.
@@ -433,13 +569,18 @@ def mainloop(tracker, motor, start_mode="manual", debug=False, audio=None, netwo
                     if not ball_was_found and time.monotonic() - last_ball_sound_time >= next_ball_sound_cooldown:
                         last_ball_sound_time = time.monotonic()
                         next_ball_sound_cooldown = _random_ball_sound_cooldown()
-                        audio.queue(random.choice(BALL_SOUND_PATHS))
+                        last_ball_found_sound_path = _random_choice_excluding(
+                            BALL_SOUND_PATHS, last_ball_found_sound_path)
+                        audio.queue(last_ball_found_sound_path, volume=audio.ball_volume)
                     ball_was_found = True
                     ball_lost_time = None
                     lost_ball_sound_played = False
 
                     throttle, steering = _follow_ball_throttle_steering(result, tracker)
-                    debug_print(f"[mainloop] FOLLOW_BALL: motor.drive(throttle={throttle:.3f}, steering={steering:.3f})")
+                    follow_drive_msg = f"[mainloop] FOLLOW_BALL: motor.drive(throttle={throttle:.3f}, steering={steering:.3f})"
+                    if follow_drive_msg != last_follow_drive_msg:  # only print on change
+                        debug_print(follow_drive_msg)
+                        last_follow_drive_msg = follow_drive_msg
                     motor.drive(throttle=throttle, steering=steering)
                 else:
                     # No ball currently detected -- fall back to manual gamepad
@@ -456,13 +597,18 @@ def mainloop(tracker, motor, start_mode="manual", debug=False, audio=None, netwo
                     if (ball_lost_time is not None and not lost_ball_sound_played
                             and time.monotonic() - ball_lost_time >= ball_lost_sound_delay):
                         lost_ball_sound_played = True
-                        audio.queue(random.choice(LOST_BALL_SOUND_PATHS))
+                        last_lost_ball_sound_path = _random_choice_excluding(
+                            LOST_BALL_SOUND_PATHS, last_lost_ball_sound_path)
+                        audio.queue(last_lost_ball_sound_path, volume=audio.ball_volume)
 
                     left, right = command_handler.left, command_handler.right
-                    debug_print(
+                    follow_manual_msg = (
                         f"[mainloop] FOLLOW_BALL: ball not found -> manual control "
                         f"motor.drive_lr(left={left:.3f}, right={right:.3f})"
                     )
+                    if follow_manual_msg != last_follow_manual_msg:  # only print on change
+                        debug_print(follow_manual_msg)
+                        last_follow_manual_msg = follow_manual_msg
                     motor.drive_lr(left=left, right=right)
             elif mode is Mode.MANUAL:
                 left, right = command_handler.left, command_handler.right
@@ -471,12 +617,15 @@ def mainloop(tracker, motor, start_mode="manual", debug=False, audio=None, netwo
                     f"(throttle={command_handler.throttle:.3f}, steering={command_handler.steering:.3f})"
                 )
                 if manual_msg != last_manual_msg:  # this loop runs ~20x/s -- only print on change
-                    print(manual_msg)
+                    debug_print(manual_msg)
                     last_manual_msg = manual_msg
                 motor.drive_lr(left=left, right=right)
                 time.sleep(MAINLOOP_IDLE_SLEEP_S)
             else:  # Mode.IDLE
-                debug_print("[mainloop] IDLE: motor.stop()")
+                idle_msg = "[mainloop] IDLE: motor.stop()"
+                if idle_msg != last_idle_msg:  # only print on change (i.e. once, on entering IDLE)
+                    debug_print(idle_msg)
+                    last_idle_msg = idle_msg
                 motor.stop()
                 time.sleep(MAINLOOP_IDLE_SLEEP_S)
     except KeyboardInterrupt:
@@ -673,6 +822,8 @@ def main():
     sys.stdout.reconfigure(line_buffering=True)
     sys.stderr.reconfigure(line_buffering=True)
     audio = TrackbotAudio()  # shared across the network-status check and mainloop()
+    load_random_sounds(audio=audio)
+    load_ball_sounds()
     network_state = _log_network_status(audio)
     args = get_args()
     tracker, motor = init(args)

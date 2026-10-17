@@ -20,7 +20,7 @@ import time
 from pathlib import Path
 
 DEFAULT_PLAYER_CMD = "pw-play"
-PLAYBACK_VOLUME = 0.9  # 0-1.0, passed to pw-play's --volume for every clip
+PLAYBACK_VOLUME = 0.9  # 0-1.0, the initial value of self.volume (see set_volume())
 PAUSE_SOUND_PATH = Path(__file__).parent / "sounds" / "silentonesec.wav"  # 1s of silence
 
 _STOP = object()  # sentinel put on the queue to shut the worker thread down
@@ -39,28 +39,52 @@ class TrackbotAudio:
         self._queue = queue.Queue()
         self._lock = threading.Lock()
         self._current_proc = None
+        self.volume = PLAYBACK_VOLUME  # 0.0-1.0, applied to each clip as it starts -- see set_volume()
+        # Separate volume for ball-found/ball-lost clips (BALL_SOUND_PATHS/
+        # LOST_BALL_SOUND_PATHS in run_trackbot.py) -- pass volume=self.ball_volume
+        # to queue()/play() for those specifically; everything else keeps using
+        # self.volume. See set_ball_volume().
+        self.ball_volume = PLAYBACK_VOLUME
         self._worker = threading.Thread(target=self._run, daemon=True)
         self._worker.start()
 
-    def play(self, path, pause_after=False):
+    def set_volume(self, value):
+        """Set the volume (0.0-1.0, clamped, then rounded to the nearest 0.1 --
+        so repeated +/- steps always land exactly on 0.0, 0.1, 0.2, ..., 1.0,
+        never drifting off by floating-point noise) applied to clips from now
+        on (that don't get their own volume= override -- see queue()/play()).
+        Already-playing/queued clips started before this call keep whatever
+        volume they were launched with."""
+        self.volume = round(max(0.0, min(1.0, value)), 1)
+        return self.volume
+
+    def set_ball_volume(self, value):
+        """Same as set_volume(), but for self.ball_volume (ball-found/ball-lost
+        clips) instead of the general self.volume."""
+        self.ball_volume = round(max(0.0, min(1.0, value)), 1)
+        return self.ball_volume
+
+    def play(self, path, pause_after=False, volume=None):
         """Stop current playback, clear the queue, and play path now. If
         pause_after, queue a 1s silence clip right behind it."""
         self.stop()
-        self.queue(path, pause_after=pause_after)
+        self.queue(path, pause_after=pause_after, volume=volume)
 
-    def queue(self, path, pause_after=False):
-        """Append path to play once everything ahead of it finishes. If
-        pause_after, also queue a 1s silence clip right behind it, so whatever
-        plays next (from this call or a later one) doesn't run straight on."""
-        self._queue_one(path)
+    def queue(self, path, pause_after=False, volume=None):
+        """Append path to play once everything ahead of it finishes. volume
+        (0.0-1.0), if given, overrides self.volume for this clip only -- e.g.
+        pass self.ball_volume for a ball-found/ball-lost clip. If pause_after,
+        also queue a 1s silence clip right behind it, so whatever plays next
+        (from this call or a later one) doesn't run straight on."""
+        self._queue_one(path, volume)
         if pause_after:
-            self._queue_one(PAUSE_SOUND_PATH)
+            self._queue_one(PAUSE_SOUND_PATH, volume)
 
-    def _queue_one(self, path):
+    def _queue_one(self, path, volume=None):
         path = Path(path)
         if not path.is_file():
             raise FileNotFoundError(f"No such sound file: {path}")
-        self._queue.put(str(path))
+        self._queue.put((str(path), volume))
 
     def stop(self):
         """Stop current playback (if any) and clear the queue."""
@@ -110,14 +134,17 @@ class TrackbotAudio:
 
     def _run(self):
         while True:
-            path = self._queue.get()
-            if path is _STOP:
+            item = self._queue.get()
+            if item is _STOP:
                 return
+            path, volume = item
+            if volume is None:
+                volume = self.volume
 
             with self._lock:
                 try:
                     self._current_proc = subprocess.Popen(
-                        [self._player_cmd, "--volume", str(PLAYBACK_VOLUME), path],
+                        [self._player_cmd, "--volume", str(volume), path],
                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                     )
                 except OSError as e:
