@@ -34,7 +34,10 @@ from bot_commands import (
 )
 
 WINDOW_TITLE = "Trackbot"
-WINDOW_SIZE = "800x300"
+WINDOW_SIZE = "700x300"  # 800 * 7/8 -- the virtual gamepad is placed with absolute pixel
+                         # offsets from the left/bottom edges, so narrowing the window
+                         # doesn't change its size, just closes the empty gap between it
+                         # and the right-anchored status labels/Quit button
 
 ROUND_BUTTON_DIAMETER = 56
 ROUND_BUTTON_FILL = "#dddddd"

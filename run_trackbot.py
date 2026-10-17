@@ -290,10 +290,6 @@ def mainloop(tracker, motor, start_mode="manual", debug=False, audio=None, netwo
     base_mode = Mode[start_mode.upper()]  # the mode to fall back to when FOLLOW_BALL is off
     window.set_mode(base_mode.name)
     window.set_video_status("Recording" if tracker.video_recorder.recording else "Off")
-    last_manual_msg = None  # last MANUAL-mode drive message printed, so it isn't repeated when unchanged
-    last_follow_drive_msg = None  # last FOLLOW_BALL "motor.drive(...)" message, so it isn't repeated when unchanged
-    last_follow_manual_msg = None  # last FOLLOW_BALL "ball not found" message, so it isn't repeated when unchanged
-    last_idle_msg = None  # last IDLE message, so it isn't repeated every iteration while idle
     last_recording_state = tracker.video_recorder.recording
     last_follow_state = command_handler.follow_ball
     last_mode = base_mode  # for logging entering/leaving ball tracking mode below
@@ -311,7 +307,6 @@ def mainloop(tracker, motor, start_mode="manual", debug=False, audio=None, netwo
     last_ball_found_sound_path = None
     last_lost_ball_sound_path = None
     last_random_sounds_button_path = None
-    last_drive_state = None  # last logged (throttle/steering/left/right) snapshot, to log only changes
     last_effective_buttons = {}  # last (real gamepad | virtual window) merged button state we acted on
     gamepad_in_use = False  # real gamepad has sent input since it (re)connected -- arms the dropout fail-safe
 
@@ -339,15 +334,25 @@ def mainloop(tracker, motor, start_mode="manual", debug=False, audio=None, netwo
     # taking effect in that case rather than silently failing to drive.
     follow_ball_available = not isinstance(tracker, PlainCameraViewer)
 
-    def debug_print(msg):
-        # No dedup here -- callers that need "only when changed" (most of them)
-        # track their own last-printed value and only call this when it differs;
-        # a single shared last-message check doesn't work once more than one
-        # call site can fire in the same iteration (e.g. [drive] every iteration
-        # alongside a mode-specific message), since each would see the other's
-        # text as "different" and both would re-print every iteration forever.
-        if debug:
-            print(msg)
+    last_debug_msgs = {}  # tag -> last message printed with that tag, for debug_print()'s dedup
+
+    def debug_print(msg, tag=None):
+        """Print msg if --debug is set. If tag is given, dedup against it: only
+        print if msg differs from the last message printed with that same tag,
+        tracked in last_debug_msgs. Each tag has its own independent history, so
+        multiple call sites (e.g. "[drive]" every iteration alongside a
+        mode-specific message) can each dedupe against their own stream without
+        clobbering each other -- a single shared last-message check doesn't
+        work there, since each site would see the other's text as "different"
+        and both would re-print every iteration forever. tag=None (the default)
+        means print every time, no dedup."""
+        if not debug:
+            return
+        if tag is not None:
+            if last_debug_msgs.get(tag) == msg:
+                return
+            last_debug_msgs[tag] = msg
+        print(msg)
 
     try:
         while True:
@@ -396,12 +401,9 @@ def mainloop(tracker, motor, start_mode="manual", debug=False, audio=None, netwo
                 command_handler.process_command(GamepadState(buttons=effective_buttons))
             command_handler.tick()  # ease throttle toward its target, independent of new events
 
-            drive_state = command_handler.drive_state()
-            if drive_state != last_drive_state:
-                last_drive_state = drive_state
-                target, throttle_now, presses, steer, left_now, right_now = drive_state
-                debug_print(f"[drive] throttle={throttle_now:.3f} (target={target:.3f}, presses={presses}) "
-                            f"steering={steer:+.0f} -> left={left_now:.3f} right={right_now:.3f}")
+            target, throttle_now, presses, steer, left_now, right_now = command_handler.drive_state()
+            debug_print(f"[drive] throttle={throttle_now:.3f} (target={target:.3f}, presses={presses}) "
+                        f"steering={steer:+.0f} -> left={left_now:.3f} right={right_now:.3f}", tag="drive")
 
             gamepad_connected = controller.device is not None
             if gamepad_connected != gamepad_was_connected:
@@ -577,10 +579,10 @@ def mainloop(tracker, motor, start_mode="manual", debug=False, audio=None, netwo
                     lost_ball_sound_played = False
 
                     throttle, steering = _follow_ball_throttle_steering(result, tracker)
-                    follow_drive_msg = f"[mainloop] FOLLOW_BALL: motor.drive(throttle={throttle:.3f}, steering={steering:.3f})"
-                    if follow_drive_msg != last_follow_drive_msg:  # only print on change
-                        debug_print(follow_drive_msg)
-                        last_follow_drive_msg = follow_drive_msg
+                    debug_print(
+                        f"[mainloop] FOLLOW_BALL: motor.drive(throttle={throttle:.3f}, steering={steering:.3f})",
+                        tag="follow_drive",
+                    )
                     motor.drive(throttle=throttle, steering=steering)
                 else:
                     # No ball currently detected -- fall back to manual gamepad
@@ -602,30 +604,23 @@ def mainloop(tracker, motor, start_mode="manual", debug=False, audio=None, netwo
                         audio.queue(last_lost_ball_sound_path, volume=audio.ball_volume)
 
                     left, right = command_handler.left, command_handler.right
-                    follow_manual_msg = (
+                    debug_print(
                         f"[mainloop] FOLLOW_BALL: ball not found -> manual control "
-                        f"motor.drive_lr(left={left:.3f}, right={right:.3f})"
+                        f"motor.drive_lr(left={left:.3f}, right={right:.3f})",
+                        tag="follow_manual",
                     )
-                    if follow_manual_msg != last_follow_manual_msg:  # only print on change
-                        debug_print(follow_manual_msg)
-                        last_follow_manual_msg = follow_manual_msg
                     motor.drive_lr(left=left, right=right)
             elif mode is Mode.MANUAL:
                 left, right = command_handler.left, command_handler.right
-                manual_msg = (
+                debug_print(
                     f"[mainloop] MANUAL: motor.drive_lr(left={left:.3f}, right={right:.3f}) "
-                    f"(throttle={command_handler.throttle:.3f}, steering={command_handler.steering:.3f})"
+                    f"(throttle={command_handler.throttle:.3f}, steering={command_handler.steering:.3f})",
+                    tag="manual",
                 )
-                if manual_msg != last_manual_msg:  # this loop runs ~20x/s -- only print on change
-                    debug_print(manual_msg)
-                    last_manual_msg = manual_msg
                 motor.drive_lr(left=left, right=right)
                 time.sleep(MAINLOOP_IDLE_SLEEP_S)
             else:  # Mode.IDLE
-                idle_msg = "[mainloop] IDLE: motor.stop()"
-                if idle_msg != last_idle_msg:  # only print on change (i.e. once, on entering IDLE)
-                    debug_print(idle_msg)
-                    last_idle_msg = idle_msg
+                debug_print("[mainloop] IDLE: motor.stop()", tag="idle")
                 motor.stop()
                 time.sleep(MAINLOOP_IDLE_SLEEP_S)
     except KeyboardInterrupt:
