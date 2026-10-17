@@ -166,6 +166,7 @@ def load_random_sounds(folder=None, audio=None, speech=None):
         if using_this_folder_path.is_file():
             audio.queue(str(using_this_folder_path))
     if speech is not None:
+        # Intentional use of "Red" instead of "Read" (reed)
         speech.say(f"Red {len(RANDOM_SOUNDS_BUTTON_PATHS)} sounds from {folder}")
     return folder
 
@@ -204,19 +205,7 @@ FOLLOWING_ON_SOUND_PATH = "./sounds/followingison.wav"
 FOLLOWING_OFF_SOUND_PATH = "./sounds/followingisoff.wav"
 
 ETHERNET_CONNECTED_SOUND_PATH = "./sounds/ethernetconnected.wav"
-WIFI_CONNECTED_SOUND_PATH = "./sounds/wificonnected.wav"  # fallback for a wifi network not in NETWORK_NAME_SOUND_PATHS
 NO_NETWORK_SOUND_PATH = "./sounds/nonetworksfound.wav"
-
-# If a connected wifi network's name (case-insensitively) matches one of these,
-# play that clip instead of the generic WIFI_CONNECTED_SOUND_PATH.
-NETWORK_NAME_SOUND_PATHS = {
-    "mercury": "./sounds/mercury.wav",
-    "trackbot": "./sounds/trackbot.wav",
-    "jupiter": "./sounds/jupiter.wav",
-    "mars": "./sounds/mars.wav",
-    "cinco": "./sounds/cinco.wav",
-    "venus": "./sounds/venus.wav",
-}
 
 SHUTDOWN_SOUND_PATH = "./sounds/shuttingdown.wav"
 READY_SOUND_PATH = "./sounds/readytoroll.wav"  # queued right after the startup gamepad-status announcement
@@ -562,7 +551,7 @@ def mainloop(tracker, motor, start_mode="manual", debug=False, audio=None, speec
                     connected_types, connected, wifi_names = network_check_result.pop()
                     if connected_types != last_network_types or wifi_names != last_network_wifi_names:
                         last_network_types, last_network_wifi_names = connected_types, wifi_names
-                        _announce_network(audio, connected_types, connected, wifi_names)
+                        _announce_network(audio, connected_types, connected, wifi_names, speech=speech)
             if (network_check_thread is None
                     and time.monotonic() - last_network_check_time >= NETWORK_RECHECK_INTERVAL_S):
                 last_network_check_time = time.monotonic()
@@ -670,7 +659,7 @@ def _check_network_once():
     wifi_names) -- connected_types is a set of "wifi"/"ethernet" strings,
     connected_desc a list of human-readable "type device -> connection" strings
     for logging, wifi_names the connection name(s) of any connected wifi
-    interface(s) (for matching against NETWORK_NAME_SOUND_PATHS). Never raises --
+    interface(s) (spoken by _announce_network() if connected). Never raises --
     a missing nmcli is just reported as no connection, not fatal."""
     connected_types = set()
     connected = []
@@ -696,12 +685,12 @@ def _check_network_once():
     return connected_types, connected, wifi_names
 
 
-def _announce_network(audio, connected_types, connected, wifi_names):
-    """Log the given network check result and, if audio is given, play a sound
-    for each connected interface -- ethernet then wifi, queued one after the
-    other, if both are connected -- or the no-network sound if neither is. A
-    wifi connection whose network name matches NETWORK_NAME_SOUND_PATHS plays
-    that clip instead of the generic wifi-connected one (see _wifi_sound_path)."""
+def _announce_network(audio, connected_types, connected, wifi_names, speech=None):
+    """Log the given network check result. If audio is given, play a sound for
+    ethernet (if connected) or the no-network sound (if neither is connected),
+    queued one after the other if both apply. If wifi is connected and speech
+    is given, speaks the connected network's name instead of playing a sound
+    for it -- speech.say() is non-blocking (see trackbot_speech.py)."""
     if connected:
         print(f"[network] Connected: {', '.join(connected)}")
     else:
@@ -710,27 +699,16 @@ def _announce_network(audio, connected_types, connected, wifi_names):
     if audio is not None:
         # queue(), not play() -- this runs first in practice, but queue() still
         # can't ever cut off something already playing/queued, unlike play().
-        # Both get queued (not elif) so both are announced when both are connected.
         if "ethernet" in connected_types:
             audio.queue(ETHERNET_CONNECTED_SOUND_PATH, pause_after=True)
-        if "wifi" in connected_types:
-            audio.queue(_wifi_sound_path(wifi_names), pause_after=True)
         if not connected_types:
             audio.queue(NO_NETWORK_SOUND_PATH, pause_after=True)
 
-
-def _wifi_sound_path(wifi_names):
-    """Return the NETWORK_NAME_SOUND_PATHS entry for the first connected wifi
-    network name that matches (case-insensitively), or WIFI_CONNECTED_SOUND_PATH
-    if none of them do."""
-    for name in wifi_names:
-        sound_path = NETWORK_NAME_SOUND_PATHS.get(name.strip().lower())
-        if sound_path:
-            return sound_path
-    return WIFI_CONNECTED_SOUND_PATH
+    if "wifi" in connected_types and wifi_names and speech is not None:
+        speech.say(f"Connected to wifi network {wifi_names[0]}")
 
 
-def _log_network_status(audio=None):
+def _log_network_status(audio=None, speech=None):
     """Best-effort: log which network interfaces (wifi/ethernet) are connected,
     to what, and the device's IP address(es) -- useful from the startup log for
     diagnosing "why can't I SSH/VNC in" without needing a monitor on the bot.
@@ -751,7 +729,7 @@ def _log_network_status(audio=None):
         time.sleep(NETWORK_CHECK_RETRY_INTERVAL_S)
         connected_types, connected, wifi_names = _check_network_once()
 
-    _announce_network(audio, connected_types, connected, wifi_names)
+    _announce_network(audio, connected_types, connected, wifi_names, speech=speech)
 
     try:
         ip_result = subprocess.run(["hostname", "-I"], capture_output=True, text=True, timeout=5)
@@ -828,7 +806,7 @@ def main():
     speech = TrackbotSpeech()  # shared with mainloop() the same way
     load_random_sounds(audio=audio, speech=speech)
     load_ball_sounds()
-    network_state = _log_network_status(audio)
+    network_state = _log_network_status(audio, speech=speech)
     args = get_args()
     tracker, motor = init(args)
     mainloop(tracker, motor, start_mode=args.start_mode, debug=args.debug,
