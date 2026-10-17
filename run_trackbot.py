@@ -274,10 +274,13 @@ MAINLOOP_IDLE_SLEEP_S = 0.01
 
 
 def mainloop(tracker, motor, start_mode="manual", debug=False, audio=None, speech=None, network_state=None):
+    # Shared so a TrackbotAudio sound effect and a TrackbotSpeech utterance
+    # never play at the same time -- see both classes' playback_lock docs.
+    playback_lock = threading.Lock()
     if audio is None:
-        audio = TrackbotAudio()
+        audio = TrackbotAudio(playback_lock=playback_lock)
     if speech is None:
-        speech = TrackbotSpeech()
+        speech = TrackbotSpeech(playback_lock=playback_lock)
     window = TrackbotWindow()
     window_closed = False
     controller = BTGamepadController(verbose=debug)
@@ -628,7 +631,11 @@ def mainloop(tracker, motor, start_mode="manual", debug=False, audio=None, speec
         # the program is exiting in a fixed 4s window regardless, so if some
         # other clip were still queued ahead of this, queue() could let the
         # shutdown announcement get silently skipped by the timeout below
-        # without ever actually playing.
+        # without ever actually playing. speech.stop() for the same reason --
+        # audio and speech share a playback lock (see both classes' docs), so
+        # a still-talking utterance would otherwise make the shutdown sound
+        # wait its turn too, risking the same silent-skip past the timeout.
+        speech.stop()
         audio.play(SHUTDOWN_SOUND_PATH)
         audio.wait_for_sound(timeout=4)
         motor.close()
@@ -802,8 +809,12 @@ def main():
     # up until exit. Flush on every newline instead.
     sys.stdout.reconfigure(line_buffering=True)
     sys.stderr.reconfigure(line_buffering=True)
-    audio = TrackbotAudio()  # shared across the network-status check and mainloop()
-    speech = TrackbotSpeech()  # shared with mainloop() the same way
+    # Shared so a TrackbotAudio sound effect and a TrackbotSpeech utterance never
+    # play at the same time -- see both classes' playback_lock docs. audio/speech
+    # themselves are shared across the network-status check and mainloop().
+    playback_lock = threading.Lock()
+    audio = TrackbotAudio(playback_lock=playback_lock)
+    speech = TrackbotSpeech(playback_lock=playback_lock)
     load_random_sounds(audio=audio, speech=speech)
     load_ball_sounds()
     network_state = _log_network_status(audio, speech=speech)

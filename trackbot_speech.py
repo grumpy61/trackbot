@@ -74,11 +74,23 @@ class TrackbotSpeech:
     All say() calls run through one worker thread, so they're serialized --
     queued one after another, never overlapping/talking over each other --
     the same ordering guarantee as TrackbotAudio.queue().
+
+    Unlike the module-level speak(), this manages its own subprocesses (via
+    Popen, not the blocking subprocess.run()) rather than calling speak(), for
+    two reasons: stop() needs a live process handle to interrupt whatever's
+    currently running, and playback (not synthesis -- that stays silent, so it
+    can run in parallel) needs to go through playback_lock, if given, so it
+    never overlaps with a TrackbotAudio sound effect actually playing. Pass
+    the *same* lock instance to both a TrackbotAudio and a TrackbotSpeech to
+    get that guarantee between them.
     """
 
-    def __init__(self, voice=DEFAULT_VOICE):
+    def __init__(self, voice=DEFAULT_VOICE, playback_lock=None):
         self.voice = voice
+        self._playback_lock = playback_lock or threading.Lock()
         self._queue = queue.Queue()
+        self._lock = threading.Lock()  # guards self._current_proc, mirrors TrackbotAudio
+        self._current_proc = None
         self._worker = threading.Thread(target=self._run, daemon=True)
         self._worker.start()
 
@@ -88,11 +100,29 @@ class TrackbotSpeech:
         override the instance default (see __init__) for this utterance only."""
         self._queue.put((text, voice or self.voice, volume))
 
+    def stop(self):
+        """Terminate whatever's currently being synthesized or played (if
+        anything) and drop everything still queued -- e.g. so an urgent
+        announcement (like the shutdown sound) isn't stuck waiting behind, or
+        competing with, an in-progress utterance."""
+        with self._lock:
+            self._drain_queue_locked()
+            proc = self._current_proc
+        if proc is not None:
+            proc.terminate()
+
     def close(self):
-        """Shut down the background worker thread once the queue drains. Does
-        not interrupt whatever's currently being synthesized/played."""
+        """Stop (see stop()) and shut down the background worker thread."""
+        self.stop()
         self._queue.put(_STOP)
         self._worker.join(timeout=10)
+
+    def _drain_queue_locked(self):
+        while True:
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:
+                return
 
     def _run(self):
         while True:
@@ -101,12 +131,51 @@ class TrackbotSpeech:
                 return
             text, voice, volume = item
             try:
-                speak(text, voice=voice, volume=volume)
+                self._speak_one(text, voice, volume)
             except Exception as e:
                 # Never let one bad utterance (missing voice model, piper/pw-play
                 # failure, ...) kill the worker thread -- that would silently
                 # strand every say() still queued (and all future ones) forever.
                 print(f"[TrackbotSpeech] Failed to speak {text!r} (voice={voice!r}): {e}")
+
+    def _speak_one(self, text, voice, volume):
+        if volume is None:
+            volume = PLAYBACK_VOLUME
+        model_path = _voice_model_path(voice)
+        if not model_path.is_file():
+            raise FileNotFoundError(f"Piper voice model not found: {model_path}")
+
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as wav_file:
+            wav_path = Path(wav_file.name)
+        print(f"[trackbot_speech] Saving audio to {wav_path}")
+
+        try:
+            # Synthesis is silent, so it isn't behind playback_lock -- it can run
+            # while a sound effect (or another utterance) is actually playing;
+            # only the audible step below needs mutual exclusion with that.
+            with self._lock:
+                self._current_proc = subprocess.Popen(
+                    ["piper", "--model", str(model_path), "--output-file", str(wav_path)],
+                    stdin=subprocess.PIPE, text=True,
+                )
+            proc = self._current_proc
+            proc.communicate(input=text)
+            with self._lock:
+                self._current_proc = None
+            if proc.returncode != 0:
+                raise subprocess.CalledProcessError(proc.returncode, "piper")
+
+            with self._playback_lock:
+                with self._lock:
+                    self._current_proc = subprocess.Popen(
+                        [PLAYER_CMD, "--volume", str(volume), str(wav_path)],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    )
+                self._current_proc.wait()
+                with self._lock:
+                    self._current_proc = None
+        finally:
+            wav_path.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":

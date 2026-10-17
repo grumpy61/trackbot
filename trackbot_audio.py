@@ -32,10 +32,15 @@ class TrackbotAudio:
     play(path) stops whatever's currently playing, drops anything queued, and
     plays path immediately. queue(path) instead appends path to play after
     everything ahead of it finishes, without disturbing current playback.
+
+    Pass the *same* playback_lock instance to both a TrackbotAudio and a
+    TrackbotSpeech to guarantee their playback never overlaps -- whichever
+    grabs it first plays to completion while the other waits its turn.
     """
 
-    def __init__(self, player_cmd=DEFAULT_PLAYER_CMD):
+    def __init__(self, player_cmd=DEFAULT_PLAYER_CMD, playback_lock=None):
         self._player_cmd = player_cmd
+        self._playback_lock = playback_lock or threading.Lock()
         self._queue = queue.Queue()
         self._lock = threading.Lock()
         self._current_proc = None
@@ -141,21 +146,22 @@ class TrackbotAudio:
             if volume is None:
                 volume = self.volume
 
-            with self._lock:
-                try:
-                    self._current_proc = subprocess.Popen(
-                        [self._player_cmd, "--volume", str(volume), path],
-                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                    )
-                except OSError as e:
-                    print(f"[TrackbotAudio] Failed to start {self._player_cmd} for {path}: {e}")
+            with self._playback_lock:
+                with self._lock:
+                    try:
+                        self._current_proc = subprocess.Popen(
+                            [self._player_cmd, "--volume", str(volume), path],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                        )
+                    except OSError as e:
+                        print(f"[TrackbotAudio] Failed to start {self._player_cmd} for {path}: {e}")
+                        self._current_proc = None
+                        continue
+
+                self._current_proc.wait()
+
+                with self._lock:
                     self._current_proc = None
-                    continue
-
-            self._current_proc.wait()
-
-            with self._lock:
-                self._current_proc = None
 
 
 if __name__ == "__main__":
