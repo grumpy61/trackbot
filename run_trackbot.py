@@ -35,6 +35,7 @@ from bot_motor import BotMotor
 from plain_camera import PlainCameraViewer
 from track_yellow_ball import YellowBallTracker
 from trackbot_audio import TrackbotAudio
+from trackbot_speech import TrackbotSpeech
 from trackbot_window import TrackbotWindow
 
 
@@ -139,7 +140,7 @@ USING_THIS_FOLDER_SOUND_NAME = "usingthisfolder.wav"
 RANDOM_SOUNDS_EXTENSIONS = ("*.wav", "*.mp3")  # pw-play (via TrackbotAudio) handles both fine
 
 
-def load_random_sounds(folder=None, audio=None):
+def load_random_sounds(folder=None, audio=None, speech=None):
     """Clear and repopulate RANDOM_SOUNDS_BUTTON_PATHS with every file matching
     RANDOM_SOUNDS_EXTENSIONS found in ./sounds/<folder> --
     RANDOM_SOUNDS_FOLDERS[_random_sounds_folder_index] (the current folder) if
@@ -148,7 +149,9 @@ def load_random_sounds(folder=None, audio=None):
     instead right after the reload. Mutates RANDOM_SOUNDS_BUTTON_PATHS in
     place (clear + extend) rather than rebinding the name, so callers that
     already hold a reference to it (e.g. random.choice(RANDOM_SOUNDS_BUTTON_PATHS)
-    in mainloop()) see the update too. Returns the folder name actually loaded."""
+    in mainloop()) see the update too. If `speech` is given, announces the
+    count once loading is done (speech.say() is non-blocking -- see
+    trackbot_speech.py). Returns the folder name actually loaded."""
     if folder is None:
         folder = RANDOM_SOUNDS_FOLDERS[_random_sounds_folder_index]
     directory = Path("./sounds") / folder
@@ -162,15 +165,17 @@ def load_random_sounds(folder=None, audio=None):
         using_this_folder_path = directory / USING_THIS_FOLDER_SOUND_NAME
         if using_this_folder_path.is_file():
             audio.queue(str(using_this_folder_path))
+    if speech is not None:
+        speech.say(f"Red {len(RANDOM_SOUNDS_BUTTON_PATHS)} sounds from {folder}")
     return folder
 
 
-def cycle_random_sounds_folder(audio=None):
+def cycle_random_sounds_folder(audio=None, speech=None):
     """Advance to the next folder in RANDOM_SOUNDS_FOLDERS (wrapping around) and
     reload RANDOM_SOUNDS_BUTTON_PATHS from it. Returns the new folder's name."""
     global _random_sounds_folder_index
     _random_sounds_folder_index = (_random_sounds_folder_index + 1) % len(RANDOM_SOUNDS_FOLDERS)
-    return load_random_sounds(audio=audio)
+    return load_random_sounds(audio=audio, speech=speech)
 
 BALL_SOUND_COOLDOWN_MIN_S = 3.0  # don't replay the sound sooner than this after the last one...
 BALL_SOUND_COOLDOWN_MAX_S = 8.0  # ...up to this long, picked at random each time (see _random_ball_sound_cooldown)
@@ -279,9 +284,11 @@ RECORD_AUTOSTART_DELAY_S = 1.0
 MAINLOOP_IDLE_SLEEP_S = 0.01
 
 
-def mainloop(tracker, motor, start_mode="manual", debug=False, audio=None, network_state=None):
+def mainloop(tracker, motor, start_mode="manual", debug=False, audio=None, speech=None, network_state=None):
     if audio is None:
         audio = TrackbotAudio()
+    if speech is None:
+        speech = TrackbotSpeech()
     window = TrackbotWindow()
     window_closed = False
     controller = BTGamepadController(verbose=debug)
@@ -444,7 +451,7 @@ def mainloop(tracker, motor, start_mode="manual", debug=False, audio=None, netwo
 
             command_handler.check_random_sounds_reload_hold(effective_buttons)
             if command_handler.consume_random_sounds_reload_request():
-                folder = cycle_random_sounds_folder(audio=audio)
+                folder = cycle_random_sounds_folder(audio=audio, speech=speech)
                 print(f"[mainloop] 'B' button held -> reloaded RANDOM_SOUNDS_BUTTON_PATHS "
                       f"from ./sounds/{folder} ({len(RANDOM_SOUNDS_BUTTON_PATHS)} files)")
 
@@ -639,6 +646,7 @@ def mainloop(tracker, motor, start_mode="manual", debug=False, audio=None, netwo
         controller.close()
         tracker.stop()
         audio.close()
+        speech.close()
         if not window_closed:
             try:
                 window.close()
@@ -817,12 +825,14 @@ def main():
     sys.stdout.reconfigure(line_buffering=True)
     sys.stderr.reconfigure(line_buffering=True)
     audio = TrackbotAudio()  # shared across the network-status check and mainloop()
-    load_random_sounds(audio=audio)
+    speech = TrackbotSpeech()  # shared with mainloop() the same way
+    load_random_sounds(audio=audio, speech=speech)
     load_ball_sounds()
     network_state = _log_network_status(audio)
     args = get_args()
     tracker, motor = init(args)
-    mainloop(tracker, motor, start_mode=args.start_mode, debug=args.debug, audio=audio, network_state=network_state)
+    mainloop(tracker, motor, start_mode=args.start_mode, debug=args.debug,
+             audio=audio, speech=speech, network_state=network_state)
 
 
 if __name__ == "__main__":
